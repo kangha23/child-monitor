@@ -40,7 +40,7 @@ DEFAULTS = {
     "keylog_enabled": True,
     "camera_enabled": False,
     "camera_interval_seconds": 0,
-    "update_url": "https://raw.githubusercontent.com/lyhotuanlinh2399-cmd/child-monitor/main/",
+    "update_url": "https://raw.githubusercontent.com/kangha23/child-monitor/main/",
     "log_dir": str(BASE_DIR / "logs"),
     "webrtc": {
         "signaling_server": "ws://127.0.0.1:8765",
