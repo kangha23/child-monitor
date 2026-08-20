@@ -1,0 +1,6 @@
+mss
+Pillow
+av
+websockets
+aiortc
+pyinstaller
