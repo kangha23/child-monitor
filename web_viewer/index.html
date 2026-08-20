@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>WebRTC Remote Desktop Pro</title>
+    <style>
+        :root {
+            --bg-primary: #090d16;
+            --bg-glass: rgba(15, 23, 42, 0.85);
+            --border-glass: rgba(255, 255, 255, 0.12);
+            --accent-blue: #3b82f6;
+            --accent-green: #22c55e;
+            --accent-amber: #f59e0b;
+            --accent-red: #ef4444;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+        body {
+            background-color: var(--bg-primary);
+            color: var(--text-main);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            overflow: hidden;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* Header / Toolbar */
+        .toolbar {
+            background: var(--bg-glass);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border-bottom: 1px solid var(--border-glass);
+            padding: 8px 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            z-index: 100;
+            gap: 12px;
+        }
+
+        .status-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 13px;
+            font-weight: 600;
+            background: rgba(255, 255, 255, 0.06);
+            padding: 4px 10px;
+            border-radius: 999px;
+            border: 1px solid var(--border-glass);
+        }
+
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--accent-amber);
+            box-shadow: 0 0 8px var(--accent-amber);
+            transition: all 0.3s ease;
+        }
+        .dot.connected { background: var(--accent-green); box-shadow: 0 0 10px var(--accent-green); }
+        .dot.error { background: var(--accent-red); box-shadow: 0 0 10px var(--accent-red); }
+
+        .metrics-bar {
+            display: flex;
+            gap: 12px;
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+        .metric-item { display: flex; align-items: center; gap: 4px; }
+        .metric-val { color: var(--text-main); font-weight: 600; }
+
+        .controls-group {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        select, button {
+            background: rgba(255, 255, 255, 0.07);
+            border: 1px solid var(--border-glass);
+            color: var(--text-main);
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            outline: none;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        select {
+            cursor: pointer;
+            appearance: none;
+            padding-right: 24px;
+            background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+            background-repeat: no-repeat;
+            background-position: right 6px center;
+            background-size: 14px;
+        }
+        select option { background: #1e293b; color: #fff; }
+        button:hover { background: rgba(255, 255, 255, 0.16); border-color: rgba(255, 255, 255, 0.3); }
+        button:active { transform: scale(0.97); }
+        button.active { background: var(--accent-blue); border-color: #60a5fa; }
+        button.danger { background: rgba(239, 68, 68, 0.2); border-color: var(--accent-red); color: #fca5a5; }
+
+        /* Viewport */
+        .viewport-container {
+            flex: 1;
+            position: relative;
+            background: #020617;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+
+        #remote-video {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            cursor: crosshair;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.8);
+            background: #000;
+        }
+
+        /* Overlay State */
+        .overlay-message {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(15, 23, 42, 0.92);
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--border-glass);
+            border-radius: 12px;
+            padding: 24px 36px;
+            text-align: center;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.6);
+            z-index: 50;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 12px;
+        }
+        .spinner {
+            width: 32px;
+            height: 32px;
+            border: 3px solid rgba(255,255,255,0.1);
+            border-radius: 50%;
+            border-top-color: var(--accent-blue);
+            animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Modal Dialog */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5);
+            z-index: 200;
+            width: 340px;
+        }
+        .modal input {
+            width: 100%;
+            padding: 10px 12px;
+            border-radius: 6px;
+            border: 1px solid #475569;
+            background: #0f172a;
+            color: #fff;
+            margin: 12px 0 16px 0;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="toolbar">
+        <div class="status-group">
+            <div class="status-badge">
+                <div id="status-dot" class="dot"></div>
+                <span id="status-text">Đang kết nối...</span>
+            </div>
+            <div class="metrics-bar">
+                <div class="metric-item">RTT: <span id="metric-rtt" class="metric-val">--</span></div>
+                <div class="metric-item">FPS: <span id="metric-fps" class="metric-val">--</span></div>
+                <div class="metric-item">Codec: <span id="metric-codec" class="metric-val">H.264</span></div>
+            </div>
+        </div>
+
+        <div class="controls-group">
+            <select id="monitor-select" onchange="changeMonitor()">
+                <option value="-1">🖥️ Toàn bộ Virtual Desktop</option>
+            </select>
+            <button id="btn-right" onclick="toggleRightClick()">🖱️ Chuột Phải</button>
+            <button onclick="sendKey('win')">🪟 Win</button>
+            <button onclick="sendKey('alttab')">🔄 Alt+Tab</button>
+            <button onclick="sendKey('showdesktop')">🖥️ Desktop</button>
+            <button onclick="openTextModal()">⌨️ Gõ Chữ</button>
+            <button class="danger" onclick="reconnect()">⚡ Kết nối lại</button>
+        </div>
+    </div>
+
+    <div class="viewport-container" id="viewport">
+        <video id="remote-video" autoplay playsinline muted></video>
+
+        <div id="loading-overlay" class="overlay-message">
+            <div class="spinner"></div>
+            <h3 id="overlay-title">Đang thiết lập WebRTC...</h3>
+            <p id="overlay-desc" style="font-size: 13px; color: var(--text-muted);">Đang kết nối STUN/TURN Relay Server</p>
+        </div>
+    </div>
+
+    <!-- Modal nhập chữ Unicode -->
+    <div id="text-modal" class="modal">
+        <h4 style="font-size: 16px;">Gõ văn bản lên máy con</h4>
+        <input type="text" id="text-input" placeholder="Nhập chuỗi văn bản cần gõ..." onkeydown="if(event.key==='Enter') submitText()">
+        <div style="display: flex; justify-content: flex-end; gap: 8px;">
+            <button onclick="closeTextModal()">Hủy</button>
+            <button style="background: var(--accent-blue); border-color: #60a5fa;" onclick="submitText()">Gửi đi</button>
+        </div>
+    </div>
+
+    <script>
+        // Lấy room_id và signaling URL từ hash hoặc query param
+        const urlParams = new URLSearchParams(window.location.search);
+        const roomId = window.location.hash.replace('#', '') || urlParams.get('room') || 'default_room';
+        const signalingUrl = urlParams.get('signaling') || (window.location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.hostname + ':8765';
+
+        const video = document.getElementById('remote-video');
+        const statusDot = document.getElementById('status-dot');
+        const statusText = document.getElementById('status-text');
+        const metricRtt = document.getElementById('metric-rtt');
+        const metricFps = document.getElementById('metric-fps');
+        const monitorSelect = document.getElementById('monitor-select');
+        const overlay = document.getElementById('loading-overlay');
+        const overlayTitle = document.getElementById('overlay-title');
+        const overlayDesc = document.getElementById('overlay-desc');
+
+        let ws = null;
+        let pc = null;
+        let dataChannel = null;
+        let screenMetadata = null;
+        let isRightClick = false;
+        let pingInterval = null;
+        let fpsCounter = 0;
+        let lastFpsTime = Date.now();
+
+        // Cấu hình ICE Server chuẩn với Google STUN & Cloudflare
+        const rtcConfig = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun.cloudflare.com:3478' }
+            ],
+            sdpSemantics: 'unified-plan'
+        };
+
+        function initSignaling() {
+            setOverlay(true, 'Đang kết nối Signaling...', 'Đang mở WebSocket tới ' + signalingUrl);
+            ws = new WebSocket(signalingUrl);
+
+            ws.onopen = () => {
+                setOverlay(true, 'Đã vào phòng...', 'Đang gửi yêu cầu kết nối tới Máy con (Room: ' + roomId + ')');
+                ws.send(JSON.stringify({ type: 'join', role: 'viewer', room: roomId }));
+            };
+
+            ws.onmessage = async (event) => {
+                const msg = JSON.parse(event.data);
+                if (msg.type === 'ready') {
+                    startWebRTC();
+                } else if (msg.type === 'offer') {
+                    await handleOffer(msg.sdp);
+                } else if (msg.type === 'answer') {
+                    await handleAnswer(msg.sdp);
+                } else if (msg.type === 'candidate') {
+                    if (pc && msg.candidate) {
+                        try {
+                            await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+                        } catch (e) {
+                            console.error('Lỗi addIceCandidate:', e);
+                        }
+                    }
+                } else if (msg.type === 'error') {
+                    setOverlay(true, 'Lỗi kết nối', msg.message);
+                    statusDot.className = 'dot error';
+                    statusText.innerText = 'Lỗi Signaling';
+                }
+            };
+
+            ws.onclose = () => {
+                statusDot.className = 'dot error';
+                statusText.innerText = 'Mất Signaling';
+                setTimeout(initSignaling, 3000);
+            };
+        }
+
+        async function startWebRTC() {
+            if (pc) pc.close();
+            pc = new RTCPeerConnection(rtcConfig);
+
+            // DataChannel
+            dataChannel = pc.createDataChannel('control', { ordered: true });
+            setupDataChannel(dataChannel);
+
+            pc.ondatachannel = (event) => {
+                setupDataChannel(event.channel);
+            };
+
+            // Nhận Video Track
+            pc.ontrack = (event) => {
+                if (event.streams && event.streams[0]) {
+                    video.srcObject = event.streams[0];
+                    setOverlay(false);
+                }
+            };
+
+            // Gửi ICE candidate qua signaling
+            pc.onicecandidate = (event) => {
+                if (event.candidate && ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'candidate', room: roomId, candidate: event.candidate }));
+                }
+            };
+
+            pc.oniceconnectionstatechange = () => {
+                const state = pc.iceConnectionState;
+                if (state === 'connected' || state === 'completed') {
+                    statusDot.className = 'dot connected';
+                    statusText.innerText = 'Đã kết nối WebRTC (H.264)';
+                    setOverlay(false);
+                    startPing();
+                } else if (state === 'disconnected' || state === 'failed') {
+                    statusDot.className = 'dot error';
+                    statusText.innerText = 'Mất kết nối P2P (Đang thử lại...)';
+                    setOverlay(true, 'Mất kết nối P2P', 'Đang tự động khởi tạo lại đường truyền (ICE Restart)...');
+                    reconnect();
+                }
+            };
+
+            // Tạo Offer
+            const offer = await pc.createOffer({ offerToReceiveVideo: true });
+            await pc.setLocalDescription(offer);
+            ws.send(JSON.stringify({ type: 'offer', room: roomId, sdp: offer }));
+        }
+
+        async function handleOffer(sdp) {
+            if (!pc) {
+                pc = new RTCPeerConnection(rtcConfig);
+                pc.ontrack = (e) => { video.srcObject = e.streams[0]; setOverlay(false); };
+                pc.ondatachannel = (e) => setupDataChannel(e.channel);
+            }
+            await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            ws.send(JSON.stringify({ type: 'answer', room: roomId, sdp: answer }));
+        }
+
+        async function handleAnswer(sdp) {
+            if (pc) {
+                await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+            }
+        }
+
+        function setupDataChannel(dc) {
+            dataChannel = dc;
+            dataChannel.onopen = () => {
+                // Yêu cầu lấy metadata màn hình
+                sendControl({ type: 'get_metadata' });
+            };
+            dataChannel.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+                if (msg.type === 'metadata') {
+                    handleMetadata(msg);
+                } else if (msg.type === 'pong') {
+                    const rtt = Date.now() - msg.t;
+                    metricRtt.innerText = rtt + 'ms';
+                }
+            };
+        }
+
+        function handleMetadata(meta) {
+            screenMetadata = meta;
+            monitorSelect.innerHTML = '<option value="-1">🖥️ Toàn bộ Virtual Desktop (' + meta.virtual_desktop.width + 'x' + meta.virtual_desktop.height + ')</option>';
+            meta.monitors.forEach((m, idx) => {
+                const primaryStr = m.is_primary ? ' [Chính]' : '';
+                const opt = document.createElement('option');
+                opt.value = idx;
+                opt.innerText = `Display ${idx + 1} (${m.width}x${m.height} - Scale ${(m.scale * 100).toFixed(0)}%)${primaryStr}`;
+                monitorSelect.appendChild(opt);
+            });
+        }
+
+        function changeMonitor() {
+            const monId = parseInt(monitorSelect.value);
+            sendControl({ type: 'switch_monitor', monitor_id: monId });
+        }
+
+        function sendControl(data) {
+            if (dataChannel && dataChannel.readyState === 'open') {
+                dataChannel.send(JSON.stringify(data));
+            }
+        }
+
+        function startPing() {
+            if (pingInterval) clearInterval(pingInterval);
+            pingInterval = setInterval(() => {
+                sendControl({ type: 'ping', t: Date.now() });
+                // Tính FPS
+                const now = Date.now();
+                if (now - lastFpsTime >= 1000) {
+                    metricFps.innerText = Math.round((fpsCounter * 1000) / (now - lastFpsTime));
+                    fpsCounter = 0;
+                    lastFpsTime = now;
+                }
+            }, 1000);
+        }
+
+        if ('requestVideoFrameCallback' in video) {
+            const countFps = () => {
+                fpsCounter++;
+                video.requestVideoFrameCallback(countFps);
+            };
+            video.requestVideoFrameCallback(countFps);
+        }
+
+        function setOverlay(show, title, desc) {
+            overlay.style.display = show ? 'flex' : 'none';
+            if (title) overlayTitle.innerText = title;
+            if (desc) overlayDesc.innerText = desc;
+        }
+
+        function reconnect() {
+            if (pc) { pc.close(); pc = null; }
+            startWebRTC();
+        }
+
+        // ==========================================
+        // Xử lý Chuột & Tọa độ Chuẩn xác (Multi-Monitor & DPI)
+        // ==========================================
+
+        function getNormalizedPos(e) {
+            const rect = video.getBoundingClientRect();
+            const videoWidth = video.videoWidth || 1920;
+            const videoHeight = video.videoHeight || 1080;
+
+            const videoAspect = videoWidth / videoHeight;
+            const elementAspect = rect.width / rect.height;
+
+            let actualWidth = rect.width;
+            let actualHeight = rect.height;
+            let offsetX = 0;
+            let offsetY = 0;
+
+            if (elementAspect > videoAspect) {
+                actualWidth = rect.height * videoAspect;
+                offsetX = (rect.width - actualWidth) / 2;
+            } else {
+                actualHeight = rect.width / videoAspect;
+                offsetY = (rect.height - actualHeight) / 2;
+            }
+
+            const mouseX = e.clientX - rect.left - offsetX;
+            const mouseY = e.clientY - rect.top - offsetY;
+
+            const normX = Math.max(0, Math.min(1, mouseX / actualWidth));
+            const normY = Math.max(0, Math.min(1, mouseY / actualHeight));
+
+            return { norm_x: normX, norm_y: normY, monitor_id: parseInt(monitorSelect.value) };
+        }
+
+        video.addEventListener('mousemove', (e) => {
+            const pos = getNormalizedPos(e);
+            sendControl({ type: 'mousemove', ...pos });
+        });
+
+        video.addEventListener('mousedown', (e) => {
+            const pos = getNormalizedPos(e);
+            const btn = isRightClick || e.button === 2 ? 'right' : (e.button === 1 ? 'middle' : 'left');
+            sendControl({ type: 'mousedown', button: btn, ...pos });
+        });
+
+        video.addEventListener('mouseup', (e) => {
+            const pos = getNormalizedPos(e);
+            const btn = isRightClick || e.button === 2 ? 'right' : (e.button === 1 ? 'middle' : 'left');
+            sendControl({ type: 'mouseup', button: btn, ...pos });
+            if (isRightClick) toggleRightClick();
+        });
+
+        video.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+        });
+
+        video.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            sendControl({ type: 'scroll', delta: e.deltaY > 0 ? -120 : 120 });
+        }, { passive: false });
+
+        function toggleRightClick() {
+            isRightClick = !isRightClick;
+            document.getElementById('btn-right').classList.toggle('active', isRightClick);
+        }
+
+        function sendKey(key) {
+            sendControl({ type: 'key', key: key });
+        }
+
+        function openTextModal() {
+            document.getElementById('text-modal').style.display = 'block';
+            document.getElementById('text-input').focus();
+        }
+        function closeTextModal() {
+            document.getElementById('text-modal').style.display = 'none';
+        }
+        function submitText() {
+            const txt = document.getElementById('text-input').value;
+            if (txt) {
+                sendControl({ type: 'text', text: txt });
+                document.getElementById('text-input').value = '';
+            }
+            closeTextModal();
+        }
+
+        // Bắt đầu khởi tạo
+        window.addEventListener('load', initSignaling);
+    </script>
+</body>
+</html>
