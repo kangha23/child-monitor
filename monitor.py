@@ -703,20 +703,19 @@ def run_runtime_code():
 
 
 def restart_process():
-    """Khởi động lại tiến trình để áp dụng bản cập nhật."""
+    """Khởi động lại tiến trình để áp dụng bản cập nhật một cách an toàn cho PyInstaller bootloader."""
+    release_single_instance()
     try:
         if getattr(sys, "frozen", False):
-            subprocess.Popen(
-                [sys.executable],
-                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-            )
+            exe_path = sys.executable
+            # Dùng cmd.exe start để tạo process độc lập với parent hợp lệ, tránh lỗi bootloader security validation
+            subprocess.Popen(f'cmd.exe /c start "" "{exe_path}"', shell=True)
         else:
-            subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve())],
-                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-            )
+            script_path = str(Path(__file__).resolve())
+            subprocess.Popen([sys.executable, script_path])
     except Exception as e:
         log_line("errors", f"restart_process: {e}")
+    time.sleep(1.0)
     os._exit(0)
 
 
@@ -1360,6 +1359,16 @@ def ensure_single_instance():
             if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
                 logger.warning("Đã có tiến trình SystemHelper khác đang chạy. Dừng tiến trình trùng lặp.")
                 os._exit(0)
+        except Exception:
+            pass
+
+
+def release_single_instance():
+    global _instance_mutex
+    if sys.platform == "win32" and kernel32 and _instance_mutex:
+        try:
+            kernel32.CloseHandle(_instance_mutex)
+            _instance_mutex = None
         except Exception:
             pass
 
