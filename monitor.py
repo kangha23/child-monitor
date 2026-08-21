@@ -708,14 +708,15 @@ def restart_process():
     try:
         if getattr(sys, "frozen", False):
             exe_path = sys.executable
-            # Dùng cmd.exe start để tạo process độc lập với parent hợp lệ, tránh lỗi bootloader security validation
-            subprocess.Popen(f'cmd.exe /c start "" "{exe_path}"', shell=True)
+            # Trì hoãn 1 giây để tiến trình cũ thoát hoàn toàn và PyInstaller bootloader dọn sạch _MEI trước khi tiến trình mới chạy
+            cmd = f'powershell -WindowStyle Hidden -Command "Start-Sleep -Seconds 1; Start-Process \'{exe_path}\'"'
+            subprocess.Popen(cmd, shell=True)
         else:
             script_path = str(Path(__file__).resolve())
             subprocess.Popen([sys.executable, script_path])
     except Exception as e:
         log_line("errors", f"restart_process: {e}")
-    time.sleep(1.0)
+    time.sleep(0.2)
     os._exit(0)
 
 
