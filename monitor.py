@@ -2,6 +2,7 @@ import asyncio
 import ctypes
 import ctypes.wintypes as wintypes
 import datetime
+import http.client
 import io
 import json
 import logging
@@ -521,23 +522,44 @@ def telegram_enabled():
     return "PASTE_YOUR" not in token and bool(token) and bool(chat)
 
 
+class TelegramSender:
+    def __init__(self):
+        self._conn = None
+        self._lock = threading.Lock()
+
+    def send_text(self, token, chat_id, text):
+        payload = json.dumps({"chat_id": chat_id, "text": text}).encode("utf-8")
+        headers = {
+            "Host": "api.telegram.org",
+            "Content-Type": "application/json",
+            "Connection": "keep-alive"
+        }
+        with self._lock:
+            for attempt in range(2):
+                try:
+                    if self._conn is None:
+                        self._conn = http.client.HTTPSConnection("api.telegram.org", timeout=15)
+                    self._conn.request("POST", f"/bot{token}/sendMessage", body=payload, headers=headers)
+                    resp = self._conn.getresponse()
+                    data = resp.read()
+                    res = json.loads(data.decode("utf-8"))
+                    return res.get("ok", False)
+                except Exception:
+                    try:
+                        if self._conn:
+                            self._conn.close()
+                    except Exception:
+                        pass
+                    self._conn = None
+        return False
+
+_tg_sender = TelegramSender()
+
+
 def send_telegram_text(text):
     if not telegram_enabled():
         return False
-    for _ in range(3):
-        try:
-            data = json.dumps({"chat_id": cfg["telegram_chat_id"], "text": text}).encode("utf-8")
-            req = urllib.request.Request(
-                f"https://api.telegram.org/bot{cfg['telegram_bot_token']}/sendMessage",
-                data=data,
-                headers={"Content-Type": "application/json"}
-            )
-            with urllib.request.urlopen(req, timeout=30):
-                pass
-            return True
-        except Exception as e:
-            time.sleep(2)
-    return False
+    return _tg_sender.send_text(cfg["telegram_bot_token"], cfg["telegram_chat_id"], text)
 
 
 def send_telegram_photo(path, caption, filename="screen.png", ctype="image/png"):
@@ -1344,16 +1366,23 @@ def ensure_single_instance():
 
 def command_listener():
     global last_update_id
+    poll_conn = None
+    headers = {"Host": "api.telegram.org", "Connection": "keep-alive"}
+
     while True:
         try:
             if not telegram_enabled():
-                time.sleep(10)
+                time.sleep(2)
                 continue
 
-            url = f"https://api.telegram.org/bot{cfg['telegram_bot_token']}/getUpdates?offset={last_update_id + 1}&timeout=10"
-            req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            if poll_conn is None:
+                poll_conn = http.client.HTTPSConnection("api.telegram.org", timeout=35)
+
+            endpoint = f"/bot{cfg['telegram_bot_token']}/getUpdates?offset={last_update_id + 1}&timeout=20"
+            poll_conn.request("GET", endpoint, headers=headers)
+            resp = poll_conn.getresponse()
+            raw_data = resp.read()
+            data = json.loads(raw_data.decode("utf-8"))
 
             if data.get("ok"):
                 for result in data.get("result", []):
@@ -1376,11 +1405,18 @@ def command_listener():
 
                     text = msg_obj.get("text", "")
                     if is_match_chat and text and text.startswith("/"):
-                        handle_command(text)
+                        # Chạy handle_command trong thread riêng để phản hồi song song tức thì
+                        threading.Thread(target=handle_command, args=(text,), daemon=True).start()
 
         except Exception as e:
             log_line("errors", f"command_listener: {e}")
-            time.sleep(1)
+            try:
+                if poll_conn:
+                    poll_conn.close()
+            except Exception:
+                pass
+            poll_conn = None
+            time.sleep(0.3)
 
 
 # ==========================================
