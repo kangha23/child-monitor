@@ -1,6 +1,6 @@
 # Child Monitor — Tài liệu Tổng quan Hệ thống & Hướng dẫn Cài đặt
 
-> **Phiên bản**: 1.0.8  
+> **Phiên bản**: 1.0.13  
 > **Cập nhật lần cuối**: 2026-08-21  
 > **Repo**: https://github.com/kangha23/child-monitor
 
@@ -191,7 +191,7 @@ Trên máy mục tiêu, gõ `/update` trong Telegram để tự động pull con
 1. Gõ `/remote` trong Telegram
 2. Bot trả về link viewer dạng:
    ```
-   https://yyyy.trycloudflare.com#<room_id>&signaling=wss://xxxx.trycloudflare.com
+   https://yyyy.trycloudflare.com/?room=<room_id>&signaling=wss://xxxx.trycloudflare.com
    ```
 3. Mở link trên trình duyệt → xem và điều khiển màn hình từ xa
 
@@ -228,7 +228,8 @@ child-monitor/
 3. So sánh với version.txt local
 4. Nếu khác → tải monitor.py, config.json, version.txt mới về
 5. Lưu vào thư mục runtime/ hoặc ghi đè trực tiếp
-6. Tự restart process
+6. Dùng cơ chế `ping 127.0.0.1 -n 3` để tạo độ trễ, cho phép tiến trình cũ tắt hẳn và dọn sạch file tạm (loại bỏ lỗi "Failed to remove temporary directory").
+7. Tự restart process mới ngầm hoàn toàn.
 ```
 
 **Quan trọng**: Mỗi khi sửa `monitor.py`, **PHẢI** nâng version trong `version.txt` để `/update` hoạt động.
