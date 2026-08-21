@@ -651,7 +651,8 @@ def fetch_remote_update():
     if not base or "PASTE_YOUR" in base:
         return False
     try:
-        version_url = base.rstrip("/") + "/version.txt"
+        # Thêm query param t=... để phá bộ nhớ đệm (cache) của GitHub raw, giúp lệnh /update nhận code tức thì
+        version_url = base.rstrip("/") + f"/version.txt?t={int(time.time())}"
         req_v = urllib.request.Request(version_url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req_v, timeout=20) as resp:
             remote_version = resp.read().decode("utf-8", "replace").strip()
@@ -660,7 +661,7 @@ def fetch_remote_update():
         if cur_v == remote_version:
             return False  # Đã ở phiên bản mới nhất
 
-        code_url = base.rstrip("/") + "/monitor.py"
+        code_url = base.rstrip("/") + f"/monitor.py?t={int(time.time())}"
         req_c = urllib.request.Request(code_url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req_c, timeout=30) as resp:
             code = resp.read().decode("utf-8", "replace")
