@@ -49,9 +49,21 @@ async def handle_connection(websocket):
                 if role == "host":
                     rooms[room_id]["host"] = websocket
                     logger.info(f"🖥️  Host joined room: {room_id}")
+                    # Thông báo cho tất cả Viewers đang chờ biết Host đã sẵn sàng
+                    for v in rooms[room_id]["viewers"]:
+                        try:
+                            await v.send(json.dumps({"type": "ready"}))
+                        except Exception:
+                            pass
                 else:
                     rooms[room_id]["viewers"].append(websocket)
                     logger.info(f"👁️  Viewer joined room: {room_id} (total: {len(rooms[room_id]['viewers'])})")
+                    # Nếu Host đã ở trong phòng, báo cho Viewer này biết để tạo Offer ngay lập tức
+                    if rooms[room_id]["host"]:
+                        try:
+                            await websocket.send(json.dumps({"type": "ready"}))
+                        except Exception:
+                            pass
 
             elif msg_type == "offer":
                 # Viewer gửi offer -> chuyển tiếp cho Host
