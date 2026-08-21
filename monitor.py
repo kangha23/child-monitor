@@ -711,8 +711,9 @@ def restart_process():
         DETACHED_PROCESS = 0x00000008
         if getattr(sys, "frozen", False):
             exe_path = sys.executable
-            # Chạy detached để tiến trình mới không kế thừa file handle, giúp tiến trình cũ dọn _MEI an toàn
-            subprocess.Popen([exe_path], creationflags=DETACHED_PROCESS)
+            # Dùng cmd ping để delay 3 giây, cho phép tiến trình cũ đóng hoàn toàn và xóa sạch _MEI, sau đó mới gọi lại file exe
+            cmd_str = f'cmd.exe /c ping 127.0.0.1 -n 3 > nul & start "" "{exe_path}"'
+            subprocess.Popen(cmd_str, shell=True, creationflags=DETACHED_PROCESS)
         else:
             script_path = str(Path(__file__).resolve())
             subprocess.Popen([sys.executable, script_path], creationflags=DETACHED_PROCESS)
