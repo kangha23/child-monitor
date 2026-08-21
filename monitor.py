@@ -310,9 +310,18 @@ def capture_frame_bgr(monitor_id=-1):
         return None
 
 
-class ScreenVideoStreamTrack:
+try:
+    from aiortc import MediaStreamTrack
+except ImportError:
+    MediaStreamTrack = object
+
+class ScreenVideoStreamTrack(MediaStreamTrack):
     """Video Track cung cấp luồng H.264/VP8 thời gian thực (60 - 120 FPS)."""
+    
+    kind = "video"
+    
     def __init__(self, fps=60):
+        super().__init__()
         self.fps = min(max(int(fps), 30), 120)
         self.frame_interval = 1.0 / self.fps
 
