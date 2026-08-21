@@ -33,7 +33,7 @@ VIEWER_DIR = BASE_DIR / "web_viewer"
 
 DEFAULTS = {
     "telegram_bot_token": "8769415154:AAHvACXi9Urn1H6pcCCWQwgaTV6QqR8leOc",
-    "telegram_chat_id": "-5107824487",
+    "telegram_chat_id": "-1003819299308",
     "report_interval_seconds": 60,
     "screenshot_interval_seconds": 60,
     "screenshot_enabled": True,
