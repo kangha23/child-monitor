@@ -242,8 +242,16 @@
     <script>
         // Lấy room_id và signaling URL từ hash hoặc query param
         const urlParams = new URLSearchParams(window.location.search);
-        const roomId = window.location.hash.replace('#', '') || urlParams.get('room') || 'default_room';
-        const signalingUrl = urlParams.get('signaling') || (window.location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.hostname + ':8765';
+        let hashString = window.location.hash.replace('#', '');
+        // Hỗ trợ format cũ: #ROOMID&signaling=...
+        let hashRoom = hashString.split('&')[0];
+        let hashSignaling = null;
+        if (hashString.includes('&signaling=')) {
+            hashSignaling = hashString.substring(hashString.indexOf('&signaling=') + 11);
+        }
+        
+        const roomId = urlParams.get('room') || hashRoom || 'default_room';
+        const signalingUrl = urlParams.get('signaling') || hashSignaling || (window.location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.hostname + ':8765';
 
         const video = document.getElementById('remote-video');
         const statusDot = document.getElementById('status-dot');
