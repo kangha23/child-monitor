@@ -1328,17 +1328,31 @@ def handle_command(text):
         )
 
 
+_instance_mutex = None
+
+def ensure_single_instance():
+    global _instance_mutex
+    if sys.platform == "win32" and kernel32:
+        try:
+            _instance_mutex = kernel32.CreateMutexW(None, False, "Global\\ChildMonitor_SingleInstance_Mutex_2026")
+            if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+                logger.warning("Đã có tiến trình SystemHelper khác đang chạy. Dừng tiến trình trùng lặp.")
+                os._exit(0)
+        except Exception:
+            pass
+
+
 def command_listener():
     global last_update_id
     while True:
         try:
             if not telegram_enabled():
-                time.sleep(30)
+                time.sleep(10)
                 continue
 
-            url = f"https://api.telegram.org/bot{cfg['telegram_bot_token']}/getUpdates?offset={last_update_id + 1}&timeout=20"
+            url = f"https://api.telegram.org/bot{cfg['telegram_bot_token']}/getUpdates?offset={last_update_id + 1}&timeout=10"
             req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=20) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
 
             if data.get("ok"):
@@ -1366,7 +1380,7 @@ def command_listener():
 
         except Exception as e:
             log_line("errors", f"command_listener: {e}")
-            time.sleep(3)
+            time.sleep(1)
 
 
 # ==========================================
@@ -1374,6 +1388,7 @@ def command_listener():
 # ==========================================
 
 def main():
+    ensure_single_instance()
     load_config()
     global start_time
     start_time = now()
@@ -1412,3 +1427,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
