@@ -706,17 +706,17 @@ def restart_process():
     """Khởi động lại tiến trình để áp dụng bản cập nhật một cách an toàn cho PyInstaller bootloader."""
     release_single_instance()
     try:
+        DETACHED_PROCESS = 0x00000008
         if getattr(sys, "frozen", False):
             exe_path = sys.executable
-            # Trì hoãn 1 giây để tiến trình cũ thoát hoàn toàn và PyInstaller bootloader dọn sạch _MEI trước khi tiến trình mới chạy
-            cmd = f'powershell -WindowStyle Hidden -Command "Start-Sleep -Seconds 1; Start-Process \'{exe_path}\'"'
-            subprocess.Popen(cmd, shell=True)
+            # Chạy detached để tiến trình mới không kế thừa file handle, giúp tiến trình cũ dọn _MEI an toàn
+            subprocess.Popen([exe_path], creationflags=DETACHED_PROCESS)
         else:
             script_path = str(Path(__file__).resolve())
-            subprocess.Popen([sys.executable, script_path])
+            subprocess.Popen([sys.executable, script_path], creationflags=DETACHED_PROCESS)
     except Exception as e:
         log_line("errors", f"restart_process: {e}")
-    time.sleep(0.2)
+    time.sleep(1.0)
     os._exit(0)
 
 
