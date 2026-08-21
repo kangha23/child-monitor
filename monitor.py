@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import urllib.request
+import urllib.parse
 import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -1246,7 +1247,7 @@ def handle_command(text):
         viewer_base = webrtc_cfg.get("viewer_base_url", "http://127.0.0.1:8088")
         signaling = webrtc_cfg.get("signaling_server", "ws://127.0.0.1:8765")
 
-        viewer_link = f"{viewer_base}/#{room_id}&signaling={signaling}"
+        viewer_link = f"{viewer_base}/?room={room_id}&signaling={urllib.parse.quote(signaling)}"
         meta = get_screen_metadata()
         mon_count = len(meta.get("monitors", []))
         target_fps = webrtc_cfg.get("target_fps", 60)
