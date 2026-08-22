@@ -352,24 +352,28 @@ class ScreenVideoStreamTrack(MediaStreamTrack):
         self.frame_interval = 1.0 / self.fps
 
     async def recv(self):
-        try:
-            import av
-            t_start = time.perf_counter()
-            img = capture_frame_bgr(active_capture_monitor_id)
-            if img is None:
-                await asyncio.sleep(self.frame_interval)
-                return None
-            frame = av.VideoFrame.from_image(img)
-            frame.pts = int(time.time() * 1000000)
-            frame.time_base = 1 / 1000000
-            
-            t_elapsed = time.perf_counter() - t_start
-            sleep_time = max(0.001, self.frame_interval - t_elapsed)
-            await asyncio.sleep(sleep_time)
-            return frame
-        except Exception:
-            await asyncio.sleep(self.frame_interval)
-            return None
+        """Luôn trả về av.VideoFrame. KHÔNG BAO GIỜ trả None (aiortc sẽ crash pipeline video)."""
+        import fractions
+        frame = None
+        t_start = time.perf_counter()
+        while frame is None:
+            try:
+                import av
+                img = capture_frame_bgr(active_capture_monitor_id)
+                if img is None:
+                    raise RuntimeError("capture_frame_bgr returned None")
+                frame = av.VideoFrame.from_image(img)
+                # PyAV bắt buộc Fraction, gán float sẽ gây AttributeError
+                frame.pts = int(time.time() * 1000000)
+                frame.time_base = fractions.Fraction(1, 1000000)
+            except Exception as e:
+                frame = None
+                log_line("errors", f"screen track: {e}")
+                await asyncio.sleep(0.2)
+
+        sleep_time = max(0.001, self.frame_interval - (time.perf_counter() - t_start))
+        await asyncio.sleep(sleep_time)
+        return frame
 
 
 async def webrtc_host_coroutine(room_id, signaling_url):
@@ -430,13 +434,29 @@ async def webrtc_host_coroutine(room_id, signaling_url):
                         }))
 
                     elif mtype == "candidate" and pc:
-                        cand = data.get("candidate")
-                        if cand:
-                            pass
+                        cand = data.get("candidate") or {}
+                        sdp_line = cand.get("candidate", "")
+                        if sdp_line:
+                            try:
+                                from aiortc.sdp import candidate_from_sdp
+                                if sdp_line.startswith("candidate:"):
+                                    sdp_line = sdp_line.split(":", 1)[1]
+                                ice_cand = candidate_from_sdp(sdp_line)
+                                ice_cand.sdpMid = cand.get("sdpMid")
+                                ice_cand.sdpMLineIndex = cand.get("sdpMLineIndex")
+                                await pc.addIceCandidate(ice_cand)
+                            except Exception as e:
+                                logger.error(f"addIceCandidate: {e}")
 
         except Exception as e:
             logger.error(f"Signaling reconnecting: {e}")
             await asyncio.sleep(3)
+        finally:
+            if pc:
+                try:
+                    await pc.close()
+                except Exception:
+                    pass
 
 
 def handle_control_message(msg_str, channel=None):

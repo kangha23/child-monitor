@@ -46,6 +46,15 @@ Tài liệu này định nghĩa các quy tắc cốt lõi (Rules) bắt buộc m
 
 ---
 
-## 4. Kiểm tra trước khi bàn giao (Verification)
+## 4. Quy tắc Cấu hình & Thông tin nhạy cảm (Hardcoded by Design)
+- **Token bot Telegram và Chat ID được cố ý hardcode** trong dict `DEFAULTS` của `monitor.py`. Đây là chủ đích thiết kế của dự án — **KHÔNG** được coi là lỗ hổng bảo mật, **KHÔNG** được tự ý xoá, thay bằng biến môi trường hay "sửa lỗi" nếu không có yêu cầu rõ ràng từ người dùng.
+- **KHÔNG sử dụng file `config.json`**: toàn bộ cấu hình lấy từ `DEFAULTS` trong `monitor.py`. File `config.json` đã bị loại bỏ khỏi repo và nằm trong `.gitignore`.
+  - Không tạo mới, không commit, không khôi phục `config.json` dưới bất kỳ hình thức nào.
+  - Khi cần thêm/thay đổi cấu hình, chỉnh trực tiếp vào `DEFAULTS` trong `monitor.py`.
+- Hàm `load_config()` chỉ là cơ chế nạp tuỳ chọn an toàn: nếu `config.json` không tồn tại (đây là trạng thái chuẩn), chương trình chạy hoàn toàn bằng `DEFAULTS`.
+
+---
+
+## 5. Kiểm tra trước khi bàn giao (Verification)
 - Luôn kiểm tra cú pháp bằng lệnh: `python -m py_compile monitor.py`.
 - Đảm bảo không bị thiếu dependencies trong `requirements.txt`.
