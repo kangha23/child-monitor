@@ -213,29 +213,45 @@ def map_norm_to_desktop(norm_x, norm_y, monitor_id=-1):
 
 def sim_mouse_move(norm_x, norm_y, monitor_id=-1):
     if sys.platform == "win32" and user32:
-        x, y = map_norm_to_desktop(norm_x, norm_y, monitor_id)
-        user32.SetCursorPos(x, y)
+        i = INPUT()
+        i.type = 0 # INPUT_MOUSE
+        i.mi.dx = int(norm_x * 65535)
+        i.mi.dy = int(norm_y * 65535)
+        i.mi.dwFlags = 0x8000 | 0x0001 # MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE
+        user32.SendInput(1, ctypes.byref(i), ctypes.sizeof(INPUT))
 
 
 def sim_mouse_down(button="left", norm_x=None, norm_y=None, monitor_id=-1):
     if sys.platform == "win32" and user32:
         if norm_x is not None and norm_y is not None:
             sim_mouse_move(norm_x, norm_y, monitor_id)
+        
         flag = 0x0002 if button == "left" else (0x0020 if button == "middle" else 0x0008)
-        user32.mouse_event(flag, 0, 0, 0, 0)
+        i = INPUT()
+        i.type = 0 # INPUT_MOUSE
+        i.mi.dwFlags = flag
+        user32.SendInput(1, ctypes.byref(i), ctypes.sizeof(INPUT))
 
 
 def sim_mouse_up(button="left", norm_x=None, norm_y=None, monitor_id=-1):
     if sys.platform == "win32" and user32:
         if norm_x is not None and norm_y is not None:
             sim_mouse_move(norm_x, norm_y, monitor_id)
+        
         flag = 0x0004 if button == "left" else (0x0040 if button == "middle" else 0x0010)
-        user32.mouse_event(flag, 0, 0, 0, 0)
+        i = INPUT()
+        i.type = 0 # INPUT_MOUSE
+        i.mi.dwFlags = flag
+        user32.SendInput(1, ctypes.byref(i), ctypes.sizeof(INPUT))
 
 
 def sim_mouse_scroll(delta):
     if sys.platform == "win32" and user32:
-        user32.mouse_event(0x0800, 0, 0, int(delta), 0)
+        i = INPUT()
+        i.type = 0 # INPUT_MOUSE
+        i.mi.mouseData = int(delta)
+        i.mi.dwFlags = 0x0800 # MOUSEEVENTF_WHEEL
+        user32.SendInput(1, ctypes.byref(i), ctypes.sizeof(INPUT))
 
 
 def sim_key_press(key_name):
@@ -247,37 +263,33 @@ def sim_key_press(key_name):
         "delete": 0x2E, "win": 0x5B
     }
     key_lower = key_name.lower()
+    
+    def send_key(vk, up=False):
+        i = INPUT()
+        i.type = 1 # INPUT_KEYBOARD
+        i.ki.wVk = vk
+        i.ki.dwFlags = 0x0002 if up else 0 # KEYEVENTF_KEYUP
+        user32.SendInput(1, ctypes.byref(i), ctypes.sizeof(INPUT))
+        
     if key_lower in vk_map:
         vk = vk_map[key_lower]
-        user32.keybd_event(vk, 0, 0, 0)
-        user32.keybd_event(vk, 0, 0x0002, 0)
+        send_key(vk)
+        send_key(vk, True)
     elif key_lower == "alttab":
-        user32.keybd_event(0x12, 0, 0, 0)
-        user32.keybd_event(0x09, 0, 0, 0)
-        user32.keybd_event(0x09, 0, 0x0002, 0)
-        user32.keybd_event(0x12, 0, 0x0002, 0)
+        send_key(0x12) # Alt
+        send_key(0x09) # Tab
+        send_key(0x09, True)
+        send_key(0x12, True)
     elif key_lower == "showdesktop":
-        user32.keybd_event(0x5B, 0, 0, 0)
-        user32.keybd_event(0x44, 0, 0, 0)
-        user32.keybd_event(0x44, 0, 0x0002, 0)
-        user32.keybd_event(0x5B, 0, 0x0002, 0)
+        send_key(0x5B)
+        send_key(0x44)
+        send_key(0x44, True)
+        send_key(0x5B, True)
 
 
 def sim_type_text(text):
     if sys.platform != "win32" or not user32:
         return
-    for c in text:
-        utf16_code = ord(c)
-        inp_down = INPUT()
-        inp_down.type = 1
-        inp_down.ki.wVk = 0
-        inp_down.ki.wScan = utf16_code
-        inp_down.ki.dwFlags = 0x0004
-        inp_down.ki.time = 0
-        inp_down.ki.dwExtraInfo = 0
-
-        inp_up = INPUT()
-        inp_up.type = 1
         inp_up.ki.wVk = 0
         inp_up.ki.wScan = utf16_code
         inp_up.ki.dwFlags = 0x0004 | 0x0002
