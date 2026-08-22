@@ -1386,10 +1386,29 @@ def release_single_instance():
             pass
 
 
+def _telegram_delete_webhook():
+    """Gọi deleteWebhook để xóa webhook cũ, đảm bảo chỉ 1 poller duy nhất."""
+    try:
+        token = cfg.get("telegram_bot_token", "")
+        conn = http.client.HTTPSConnection("api.telegram.org", timeout=10)
+        conn.request("POST", f"/bot{token}/deleteWebhook?drop_pending_updates=false",
+                      headers={"Host": "api.telegram.org"})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        logger.info("deleteWebhook OK — cleared conflicting sessions.")
+        return True
+    except Exception as e:
+        log_line("errors", f"deleteWebhook failed: {e}")
+        return False
+
+
 def command_listener():
     global last_update_id
     poll_conn = None
     headers = {"Host": "api.telegram.org", "Connection": "keep-alive"}
+    webhook_cleared = False
+    consecutive_errors = 0
 
     while True:
         try:
@@ -1397,16 +1416,48 @@ def command_listener():
                 time.sleep(2)
                 continue
 
-            if poll_conn is None:
-                poll_conn = http.client.HTTPSConnection("api.telegram.org", timeout=35)
+            # Lần kết nối đầu tiên: xóa webhook để tránh lỗi 409 Conflict
+            if not webhook_cleared:
+                _telegram_delete_webhook()
+                webhook_cleared = True
+                time.sleep(0.5)
 
-            endpoint = f"/bot{cfg['telegram_bot_token']}/getUpdates?offset={last_update_id + 1}&timeout=20"
+            if poll_conn is None:
+                poll_conn = http.client.HTTPSConnection("api.telegram.org", timeout=12)
+
+            # Long-poll timeout=5s để phản hồi lệnh nhanh hơn (trước đây 20s)
+            endpoint = f"/bot{cfg['telegram_bot_token']}/getUpdates?offset={last_update_id + 1}&timeout=5"
             poll_conn.request("GET", endpoint, headers=headers)
             resp = poll_conn.getresponse()
             raw_data = resp.read()
+
+            # Xử lý lỗi HTTP 409 Conflict — có tiến trình khác đang poll
+            if resp.status == 409:
+                log_line("errors", "command_listener: 409 Conflict — có tiến trình bot khác đang chạy. Đang reset...")
+                try:
+                    poll_conn.close()
+                except Exception:
+                    pass
+                poll_conn = None
+                _telegram_delete_webhook()
+                time.sleep(2)
+                continue
+
+            # Xử lý các lỗi HTTP khác
+            if resp.status != 200:
+                log_line("errors", f"command_listener: HTTP {resp.status}")
+                try:
+                    poll_conn.close()
+                except Exception:
+                    pass
+                poll_conn = None
+                time.sleep(1)
+                continue
+
             data = json.loads(raw_data.decode("utf-8"))
 
             if data.get("ok"):
+                consecutive_errors = 0  # Reset bộ đếm lỗi khi thành công
                 for result in data.get("result", []):
                     last_update_id = max(last_update_id, result.get("update_id", 0))
                     
@@ -1431,6 +1482,7 @@ def command_listener():
                         threading.Thread(target=handle_command, args=(text,), daemon=True).start()
 
         except Exception as e:
+            consecutive_errors += 1
             log_line("errors", f"command_listener: {e}")
             try:
                 if poll_conn:
@@ -1438,7 +1490,9 @@ def command_listener():
             except Exception:
                 pass
             poll_conn = None
-            time.sleep(0.3)
+            # Exponential backoff: 0.5s → 1s → 2s → 4s → max 8s
+            backoff = min(0.5 * (2 ** (consecutive_errors - 1)), 8)
+            time.sleep(backoff)
 
 
 # ==========================================
