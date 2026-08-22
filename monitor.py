@@ -51,8 +51,8 @@ DEFAULTS = {
     "update_url": "https://raw.githubusercontent.com/kangha23/child-monitor/main/",
     "log_dir": str(BASE_DIR / "logs"),
     "webrtc": {
-        "signaling_server": "wss://base-month-compact-compact.trycloudflare.com",
-        "viewer_base_url": "https://kruger-diane-levy-appropriations.trycloudflare.com",
+        "signaling_server": "wss://fencing-vanity-coexist.ngrok-free.dev",
+        "viewer_base_url": "https://kangha23.github.io/child-monitor/web_viewer",
         "ice_servers": [
             {"urls": "stun:stun.l.google.com:19302"},
             {"urls": "stun:stun.cloudflare.com:3478"}
